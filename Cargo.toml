@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+utils = { path ="../circuits/utils" }
+rift-lib = { path ="../circuits/lib" }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros"] }
