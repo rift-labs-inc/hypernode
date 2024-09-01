@@ -1,3 +1,6 @@
 [submodule "circuits"]
 	path = circuits
 	url = https://github.com/rift-labs-inc/circuits
+[submodule "contracts"]
+	path = contracts
+	url = https://github.com/rift-labs-inc/contracts

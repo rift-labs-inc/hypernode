@@ -6,4 +6,8 @@ edition = "2021"
 [dependencies]
 utils = { path ="../circuits/utils" }
 rift-lib = { path ="../circuits/lib" }
-tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.40.0", features = ["full"] }
+alloy = { version = "0.2", features = ["full", "node-bindings"] }
+futures-util = "0.3"
+eyre = "0.6"
+
