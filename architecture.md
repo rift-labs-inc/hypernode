@@ -2,7 +2,7 @@ On start, connect to ethereum and bitcoin rpc nodes, download all active reserva
 Take the oldest reservations timestamp, and find what bitcoin block was before that timestamp (maybe -1 hour to be safe).
 Then for every bitcoin block between then and the current height,
 search for transactions that include an OP_RETURN output with an active reservation's order nonce.
-If a btc transaction is found, validate that it's outputs match with the reservation and store the bitcoin txid and associated reservation in memory.
+If a btc transaction is found, validate that it's outputs match with the reservation and store the bitcoin txid and associated reservation in memory, this implies that the reservation is waiting for block confirmations
 
 
 Then simultaneously poll bitcoin for new blocks, and the rift exchange contract on ethereum for reservation updating events. 

@@ -1,0 +1,1 @@
+const RESERVATION_DURATION_SECS: u64 = 8 * 60 * 60;
