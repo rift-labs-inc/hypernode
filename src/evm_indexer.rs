@@ -13,7 +13,7 @@ use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
 use log::info;
 use std::error::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 use std::{any::Any, collections::HashMap};
 use std::{collections::HashSet, sync::Arc};
 use tokio::time::Duration;
@@ -26,7 +26,7 @@ use crate::core::{
 use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
 
 pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result<u64> {
-    let time = SystemTime::now();
+    let time = Instant::now();
     let provider = Arc::new(
         ProviderBuilder::new()
             .on_ws(WsConnect::new(ws_rpc_url))
@@ -62,10 +62,10 @@ pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result
 
         if block_timestamp <= target_timestamp {
             info!(
-                "Found EVM block height: {}, {:.2} hours from tip in {} ms",
+                "Found EVM block height: {}, {:.2} hours from tip in {:?}",
                 check_block,
-                (current_timestamp-block_timestamp) as f64 / 3600 as f64,
-                SystemTime::now().duration_since(time).unwrap().as_millis()
+                (current_timestamp - block_timestamp) as f64 / 3600 as f64,
+                time.elapsed()
             );
             return Ok(check_block.into());
         }
@@ -83,7 +83,7 @@ pub async fn sync_reservations(
     start_block: u64,
     rpc_concurrency: usize,
 ) -> Result<u64> {
-    let time = SystemTime::now();
+    let time = Instant::now();
     info!("Syncing reservations from block {}", start_block);
     let provider = Arc::new(
         ProviderBuilder::new()
@@ -153,9 +153,9 @@ pub async fn sync_reservations(
         .map_err(|e: Box<dyn Error>| eyre::eyre!("Failed to update reservations: {}", e))?;
 
     info!(
-        "Synced {} reservations in {} ms",
+        "Synced {} reservations in {:?}",
         total_reservations,
-        SystemTime::now().duration_since(time).unwrap().as_millis()
+        time.elapsed() 
     );
 
     Ok(latest_block)
@@ -172,9 +172,9 @@ pub async fn exchange_event_listener(
         .on_ws(WsConnect::new(ws_rpc_url))
         .await?;
 
-    let contract = RiftExchange::new(contract_address, provider);
+    let contract = RiftExchange::new(contract_address, &provider);
 
-    info!("Rift deployed at: {}", contract.address());
+    info!("Rift deployed at: {} on chain ID {}", contract.address(), &provider.get_chain_id().await?);
 
     // Create filters for each event.
     let swap_complete_filter = contract.SwapComplete_filter().watch().await?;

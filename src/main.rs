@@ -35,6 +35,10 @@ struct Args {
     /// RPC concurrency limit
     #[arg(short, long, env, default_value = "10")]
     rpc_concurrency: usize,
+
+    /// Bitcoin new block polling interval in seconds
+    #[arg(short, long, env, default_value = "30")]
+    btc_polling_interval: u64,
 }
 
 #[tokio::main]
@@ -44,12 +48,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)?;
 
+    let safe_active_reservations = Arc::new(SafeActiveReservations::new());
+
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
         evm_indexer::find_block_height_from_time(&args.evm_ws_rpc, RESERVATION_DURATION_HOURS),
         btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS)
     )?;
 
-    let safe_active_reservations = Arc::new(SafeActiveReservations::new());
     let synced_evm_height = evm_indexer::sync_reservations(
         &args.evm_ws_rpc,
         &rift_exchange_address,
@@ -59,16 +64,20 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    /*
-    let evm_listener = evm::exchange_event_listener(
-        &args.evm_ws_rpc,
-        rift_exchange_address,
-        synced_evm_height,
-        Arc::clone(&safe_active_reservations),
-        args.rpc_concurrency,
-    );
-    let bitcoin_listener = bitcoin::block_listener(&args.btc_rpc, start_evm_block_height);
-
-    */
+    tokio::try_join!(
+        evm_indexer::exchange_event_listener(
+            &args.evm_ws_rpc,
+            rift_exchange_address,
+            synced_evm_height,
+            Arc::clone(&safe_active_reservations),
+            args.rpc_concurrency
+        ),
+        btc_indexer::block_listener(
+            &args.btc_rpc,
+            start_btc_block_height,
+            args.btc_polling_interval,
+            Arc::clone(&safe_active_reservations)
+        )
+    )?;
     Ok(())
 }

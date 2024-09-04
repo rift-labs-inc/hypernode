@@ -1,94 +1,112 @@
-use eyre::Result;
-use rand::Rng;
-use serde_json::Value;
-use bitcoin::Block;
 use bitcoin::consensus::deserialize;
+use bitcoin::Block;
+use eyre::Result;
+use rand::rngs::ThreadRng;
+use rand::Rng;
+use reqwest::Client;
+use serde_json::Value;
 
-pub async fn get_block_count(rpc_url: &str) -> Result<u64> {
-    let mut rng = rand::thread_rng();
-    let client = reqwest::Client::new();
-    let response = client
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "1.0",
-            "id": rng.gen::<u64>(),
-            "method": "getblockcount",
-            "params": []
-        }));
-
-    let resp: Value = response.send().await?.json().await?;
-    Ok(resp["result"].as_u64().unwrap())
+pub struct BitcoinRpcClient {
+    client: Client,
+    rng: ThreadRng,
+    rpc_url: String,
 }
 
-pub async fn get_block_hash(rpc_url: &str, block_height: u64) -> Result<[u8; 32]> {
-    let mut rng = rand::thread_rng();
-    let client = reqwest::Client::new();
-    let response = client
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "1.0",
-            "id": rng.gen::<u64>(),
-            "method": "getblockhash",
-            "params": [block_height]
-        }));
-    let resp: Value = response.send().await?.json().await?;
-    let block_hexstr = resp["result"].as_str();
-    if block_hexstr.is_none() {
-        return Err(eyre::eyre!("Block hash doesn't exist"));
+impl BitcoinRpcClient {
+    pub fn new(rpc_url: &str) -> Self {
+        Self {
+            client: Client::new(),
+            rng: rand::thread_rng(),
+            rpc_url: rpc_url.to_string(),
+        }
     }
-    let block_hash: [u8; 32] = hex::decode(block_hexstr.unwrap())?.try_into().map_err(|_| eyre::eyre!("Invalid block hash"))?;
-    Ok(block_hash)
-}
 
-pub async fn get_block(rpc_url: &str, block_hash: &[u8; 32]) -> Result<Block> {
-    let mut rng = rand::thread_rng();
-    let client = reqwest::Client::new();
-    let response = client
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "1.0",
-            "id": rng.gen::<u64>(),
-            "method": "getblock",
-            "params": [hex::encode(block_hash), 0]
-        }));
-    let resp: Value = response.send().await?.json().await?;
-    let block_hexstr = resp["result"].as_str();
-    if block_hexstr.is_none() {
-        return Err(eyre::eyre!("Block hash doesn't exist"));
+    async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+        let response = self
+            .client
+            .post(&self.rpc_url)
+            .json(&serde_json::json!({
+                "jsonrpc": "1.0",
+                "id": self.rng.clone().gen::<u64>(),
+                "method": method,
+                "params": params
+            }))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        Ok(response["result"].clone())
     }
-    let block_bytes = hex::decode(block_hexstr.unwrap())?;
-    deserialize::<Block>(&block_bytes).map_err(|_| eyre::eyre!("Failed to deserialize block"))
+
+    pub async fn get_block_count(&self) -> Result<u64> {
+        let result = self
+            .send_request("getblockcount", Value::Array(vec![]))
+            .await?;
+        result
+            .as_u64()
+            .ok_or_else(|| eyre::eyre!("Invalid block count"))
+    }
+
+    pub async fn get_block_hash(&self, block_height: u64) -> Result<[u8; 32]> {
+        let result = self
+            .send_request("getblockhash", Value::Array(vec![block_height.into()]))
+            .await?;
+        let block_hexstr = result
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("Block hash doesn't exist"))?;
+        let block_hash: [u8; 32] = hex::decode(block_hexstr)?
+            .try_into()
+            .map_err(|_| eyre::eyre!("Invalid block hash"))?;
+        Ok(block_hash)
+    }
+
+    pub async fn get_block(&self, block_hash: &[u8; 32]) -> Result<Block> {
+        let result = self
+            .send_request(
+                "getblock",
+                Value::Array(vec![hex::encode(block_hash).into(), 0.into()]),
+            )
+            .await?;
+        let block_hexstr = result
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("Block doesn't exist"))?;
+        let block_bytes = hex::decode(block_hexstr)?;
+        deserialize::<Block>(&block_bytes).map_err(|_| eyre::eyre!("Failed to deserialize block"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::hashes::Hash;
-
     use super::*;
+    use bitcoin::hashes::Hash;
 
     #[tokio::test]
     async fn test_get_block_count() {
-        let rpc_url = "https://bitcoin-mainnet.public.blastapi.io";
-        let block_count = get_block_count(rpc_url).await.unwrap();
+        let client = BitcoinRpcClient::new("https://bitcoin-mainnet.public.blastapi.io");
+        let block_count = client.get_block_count().await.unwrap();
         assert!(block_count > 0);
     }
 
     #[tokio::test]
     async fn test_get_block_hash() {
-        let rpc_url = "https://bitcoin-mainnet.public.blastapi.io";
+        let client = BitcoinRpcClient::new("https://bitcoin-mainnet.public.blastapi.io");
         let block_height = 859812;
-        let block_hash = get_block_hash(rpc_url, block_height).await.unwrap();
+        let block_hash = client.get_block_hash(block_height).await.unwrap();
         assert_eq!(block_hash.len(), 32);
     }
 
     #[tokio::test]
     async fn test_get_block() {
-        let rpc_url = "https://bitcoin-mainnet.public.blastapi.io";
+        let client = BitcoinRpcClient::new("https://bitcoin-mainnet.public.blastapi.io");
         let block_height = 859812;
-        let mut block_hash = get_block_hash(rpc_url, block_height).await.unwrap();
-        let block = get_block(rpc_url, &block_hash).await.unwrap();
+        let mut block_hash = client.get_block_hash(block_height).await.unwrap();
+        let block = client.get_block(&block_hash).await.unwrap();
         // reverse so it matches the native byte order
-        block_hash.reverse(); 
-        assert_eq!(*block.header.block_hash().as_raw_hash().as_byte_array(), block_hash);
+        block_hash.reverse();
+        assert_eq!(
+            *block.header.block_hash().as_raw_hash().as_byte_array(),
+            block_hash
+        );
     }
 }

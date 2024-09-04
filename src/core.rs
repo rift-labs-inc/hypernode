@@ -1,7 +1,7 @@
+use alloy::sol;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use alloy::sol;
 
 sol!(
     #[allow(missing_docs)]
@@ -32,7 +32,10 @@ pub struct ReservationMetadata {
 }
 
 impl ReservationMetadata {
-    pub fn new(reservation: RiftExchange::SwapReservation, proposed_block_height: Option<u64>) -> Self {
+    pub fn new(
+        reservation: RiftExchange::SwapReservation,
+        proposed_block_height: Option<u64>,
+    ) -> Self {
         ReservationMetadata {
             proposed_block_height,
             reservation,
@@ -67,7 +70,8 @@ impl ActiveReservations {
     }
 
     pub fn insert(&mut self, swap_reservation_index: u64, reservation: ReservationMetadata) {
-        self.reservations.insert(swap_reservation_index, reservation);
+        self.reservations
+            .insert(swap_reservation_index, reservation);
     }
 
     pub fn remove(&mut self, id: u64) {
