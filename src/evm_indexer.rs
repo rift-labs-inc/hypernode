@@ -123,16 +123,16 @@ pub async fn sync_reservations(
     let active_reservations_ids: Vec<U256> = active_reservations_set.into_iter().collect();
 
     // download all reservation data from the contract
-    let reservations: HashMap<u64, ReservationMetadata> = stream::iter(active_reservations_ids)
+    let reservations: HashMap<U256, ReservationMetadata> = stream::iter(active_reservations_ids)
         .map(|reservation_id| {
             let contract = Arc::clone(&contract);
             async move {
                 let reservation = contract.getReservation(reservation_id).call().await?._0;
-                let reservation_number = u64::from_be_bytes(reservation_id.to_be_bytes());
+
                 Ok((
-                    reservation_number,
+                    reservation_id, 
                     ReservationMetadata::new(reservation, None),
-                )) as Result<(u64, ReservationMetadata), contract::Error>
+                )) as Result<(U256, ReservationMetadata), contract::Error>
             }
         })
         .buffer_unordered(rpc_concurrency)
@@ -174,21 +174,17 @@ pub async fn exchange_event_listener(
 
     let contract = RiftExchange::new(contract_address, &provider);
 
-    info!("Rift deployed at: {} on chain ID {}", contract.address(), &provider.get_chain_id().await?);
+    info!("Rift deployed at: {} on chain ID: {}", contract.address(), &provider.get_chain_id().await?);
 
     // Create filters for each event.
-    let swap_complete_filter = contract.SwapComplete_filter().watch().await?;
-    let liquidity_reserved_filter = contract.LiquidityReserved_filter().watch().await?;
-    let proof_proposed_filter = contract.ProofProposed_filter().watch().await?;
+    let swap_complete_filter = contract.SwapComplete_filter().from_block(start_index_block_height).watch().await?;
+    let liquidity_reserved_filter = contract.LiquidityReserved_filter().from_block(start_index_block_height).watch().await?;
+    let proof_proposed_filter = contract.ProofProposed_filter().from_block(start_index_block_height).watch().await?;
 
     // Convert the filters into streams.
     let mut swap_complete_stream = swap_complete_filter.into_stream();
     let mut liquidity_reserved_stream = liquidity_reserved_filter.into_stream();
     let mut proof_proposed_stream = proof_proposed_filter.into_stream();
-
-    let swap_complete_log = &RiftExchange::SwapComplete::SIGNATURE_HASH;
-    let liquidity_reserved_log = &RiftExchange::LiquidityReserved::SIGNATURE_HASH;
-    let proof_proposed_log = &RiftExchange::ProofProposed::SIGNATURE_HASH;
 
     // Use tokio::select! to multiplex the streams and capture the log
     // tokio::select! will return the first event that arrives from any of the streams
@@ -196,13 +192,27 @@ pub async fn exchange_event_listener(
     loop {
         tokio::select! {
             Some(log) = swap_complete_stream.next() => {
-                log?.1
+                let swap_reservation_index = log.clone()?.0.swapReservationIndex;
+                info!("SwapComplete with reservation index: {:?}", &swap_reservation_index);
+                active_reservations.with_lock(|reservations_guard| {
+                    reservations_guard.remove(swap_reservation_index);
+                }).await;
             }
             Some(log) = liquidity_reserved_stream.next() => {
-                log?.1
+                info!("LiquidityReserved w/ reservation index: {:?}", &log.clone()?.0.swapReservationIndex);
+                let swap_reservation_index = log.clone()?.0.swapReservationIndex;
+                let reservation = contract.getReservation(swap_reservation_index).call().await?._0;
+                active_reservations.with_lock(|reservations_guard| {
+                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation, None));
+                }).await;
             }
             Some(log) = proof_proposed_stream.next() => {
-                log?.1
+                info!("ProofProposed w/ reservation index: {:?}", &log.clone()?.0.swapReservationIndex);
+                let swap_reservation_index = log.clone()?.0.swapReservationIndex;
+                let reservation = contract.getReservation(swap_reservation_index).call().await?._0;
+                active_reservations.with_lock(|reservations_guard| {
+                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation, None));
+                }).await;
             }
         };
     }

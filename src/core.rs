@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use alloy::sol;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,7 +45,7 @@ impl ReservationMetadata {
 }
 
 pub struct ActiveReservations {
-    reservations: HashMap<u64, ReservationMetadata>,
+    reservations: HashMap<U256, ReservationMetadata>,
 }
 
 impl ActiveReservations {
@@ -55,7 +56,7 @@ impl ActiveReservations {
     }
 
     pub fn drop_expired_reservations(&mut self, current_timestamp: u64) {
-        let stale_ids: Vec<u64> = self
+        let stale_ids: Vec<U256> = self
             .reservations
             .iter()
             .filter(|&(_, metadata)| {
@@ -69,16 +70,16 @@ impl ActiveReservations {
         }
     }
 
-    pub fn insert(&mut self, swap_reservation_index: u64, reservation: ReservationMetadata) {
+    pub fn insert(&mut self, swap_reservation_index: U256, reservation: ReservationMetadata) {
         self.reservations
             .insert(swap_reservation_index, reservation);
     }
 
-    pub fn remove(&mut self, id: u64) {
+    pub fn remove(&mut self, id: U256) {
         self.reservations.remove(&id);
     }
 
-    pub fn get(&self, id: u64) -> Option<&ReservationMetadata> {
+    pub fn get(&self, id: U256) -> Option<&ReservationMetadata> {
         self.reservations.get(&id)
     }
 }

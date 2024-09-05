@@ -3,6 +3,7 @@ mod btc_rpc;
 mod constants;
 mod core;
 mod evm_indexer;
+mod proof_builder;
 
 use clap::Parser;
 use constants::RESERVATION_DURATION_HOURS;

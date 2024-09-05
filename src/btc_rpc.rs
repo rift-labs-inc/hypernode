@@ -1,6 +1,9 @@
+use std::any::Any;
+
+use anyhow::Context;
 use bitcoin::consensus::deserialize;
 use bitcoin::Block;
-use eyre::Result;
+use eyre::{eyre, Result, WrapErr};
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use reqwest::Client;
@@ -32,13 +35,47 @@ impl BitcoinRpcClient {
                 "params": params
             }))
             .send()
-            .await?
-            .json::<Value>()
-            .await?;
+            .await
+            .wrap_err("Failed to send request")?;
 
-        Ok(response["result"].clone())
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .wrap_err("Failed to get response body")?;
+
+        let json: Value = serde_json::from_str(&text).wrap_err_with(|| {
+            eyre!(
+                "Failed to parse JSON. Method: {}, Params: {:?}, Status: {}, Body: {}",
+                method,
+                params,
+                status,
+                text
+            )
+        })?;
+
+        if let Some(error) = json.get("error") {
+            if !error.is_null() {
+                return Err(eyre!(
+                    "RPC error. Method: {}, Params: {:?}, Status: {}, Body: {}",
+                    method,
+                    params,
+                    status,
+                    text
+                ));
+            }
+        }
+
+        json.get("result").cloned().ok_or_else(|| {
+            eyre!(
+                "No 'result' in response. Method: {}, Params: {:?}, Status: {}, Body: {}",
+                method,
+                params,
+                status,
+                text
+            )
+        })
     }
-
     pub async fn get_block_count(&self) -> Result<u64> {
         let result = self
             .send_request("getblockcount", Value::Array(vec![]))
