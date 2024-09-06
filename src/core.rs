@@ -25,27 +25,51 @@ sol!(
     "artifacts/IERC20.json"
 );
 
+#[derive(Clone)]
+pub struct BitcoinReservationInProgress {
+    pub proposed_block_height: u64,
+    pub proposed_block_hash: [u8; 32],
+    pub txid: [u8; 32],
+    pub confirmation_height: Option<u64>,
+    pub confirmation_block_hash: Option<[u8; 32]>
+}
+impl BitcoinReservationInProgress {
+    pub fn new(
+        proposed_block_height: u64,
+        proposed_block_hash: [u8; 32],
+        txid: [u8; 32],
+    ) -> Self {
+        BitcoinReservationInProgress {
+            proposed_block_height,
+            proposed_block_hash,
+            txid,
+            confirmation_height: None,
+            confirmation_block_hash: None,
+        }
+    }
+}
+
 // stores data about the current state of a reservation, as well as the reservation itself
 // metadata is used within the indexer to determine what to do with a reservation
+#[derive(Clone)]
 pub struct ReservationMetadata {
     pub reservation: RiftExchange::SwapReservation,
-    pub proposed_block_height: Option<u64>,
+    pub btc: Option<BitcoinReservationInProgress>,
 }
 
 impl ReservationMetadata {
     pub fn new(
         reservation: RiftExchange::SwapReservation,
-        proposed_block_height: Option<u64>,
     ) -> Self {
         ReservationMetadata {
-            proposed_block_height,
             reservation,
+            btc: None,
         }
     }
 }
 
 pub struct ActiveReservations {
-    reservations: HashMap<U256, ReservationMetadata>,
+    pub reservations: HashMap<U256, ReservationMetadata>,
 }
 
 impl ActiveReservations {
@@ -68,6 +92,21 @@ impl ActiveReservations {
         for id in stale_ids {
             self.reservations.remove(&id);
         }
+    }
+
+    pub fn update_btc_reservation(
+        &mut self,
+        id: U256,
+        proposed_block_height: u64,
+        proposed_block_hash: [u8; 32],
+        txid: [u8; 32],
+    ) {
+        let metadata = self.reservations.get_mut(&id).unwrap();
+        metadata.btc = Some(BitcoinReservationInProgress::new(
+            proposed_block_height,
+            proposed_block_hash,
+            txid,
+        ));
     }
 
     pub fn insert(&mut self, swap_reservation_index: U256, reservation: ReservationMetadata) {

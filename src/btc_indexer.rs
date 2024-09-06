@@ -1,11 +1,72 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block};
 use eyre::Result;
-use log::{debug, info};
-use serde_json::{self, Value};
+use log::info;
 
 use crate::{btc_rpc::BitcoinRpcClient, core::SafeActiveReservations};
+
+fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
+    Builder::new()
+        .push_opcode(OP_RETURN)
+        .push_slice(&order_nonce)
+        .into_script().into_bytes()
+}
+
+
+async fn analyze_block_for_payments(
+    block: &Block,
+    active_reservations: Arc<SafeActiveReservations>,
+) -> Result<()> {
+
+    let expected_order_inscriptions = active_reservations
+        .with_lock(|reservations_guard| {
+            reservations_guard.reservations.iter().map(|(id, metadata)| {
+                let script = build_rift_inscription(metadata.reservation.nonce.0);
+                (id.clone(), script)
+            }).collect::<Vec<_>>()
+        })
+        .await;
+
+    for tx in block.txdata.iter() {
+        for script in tx.output.iter().map(|out| out.script_pubkey.clone()) {
+            for (id, expected_script) in expected_order_inscriptions.iter() {
+                if script.as_bytes() == expected_script {
+                    let block_height = block.bip34_block_height()? as u64;
+                    info!("Found payment for reservation: {}, txid: {} at block height: {}", id, tx.compute_txid(), block_height);
+                    active_reservations.with_lock(|reservations_guard| {
+                        reservations_guard.update_btc_reservation(
+                            *id,
+                            block_height,
+                            *block.block_hash().as_raw_hash().as_byte_array(),
+                            *tx.compute_txid().as_byte_array(),
+                        );
+                    }).await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn analyze_reservations_for_sufficient_confirmations(
+    block: &Block,
+    active_reservations: Arc<SafeActiveReservations>,
+) -> Result<()> {
+    let reservations = active_reservations
+        .with_lock(|reservations_guard| {
+            reservations_guard.reservations.iter().map(|(id, metadata)| {
+                (id.clone(), metadata.btc.clone())
+            }).collect::<Vec<_>>()
+        })
+        .await;
+    
+    // 
+    
+    Ok(())
+}
 
 pub async fn find_block_height_from_time(rpc_url: &str, hours: u64) -> Result<u64> {
     let rpc = BitcoinRpcClient::new(rpc_url);
@@ -62,9 +123,7 @@ pub async fn block_listener(
                 .get_block(&rpc.get_block_hash(analyzed_height).await?)
                 .await?;
             
-            todo!("Implement block analysis");
-
-
+            analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
             
             let blocks_synced = analyzed_height - start_block_height + 1;
             let progress_percentage = (blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0;

@@ -131,7 +131,7 @@ pub async fn sync_reservations(
 
                 Ok((
                     reservation_id, 
-                    ReservationMetadata::new(reservation, None),
+                    ReservationMetadata::new(reservation),
                 )) as Result<(U256, ReservationMetadata), contract::Error>
             }
         })
@@ -203,7 +203,7 @@ pub async fn exchange_event_listener(
                 let swap_reservation_index = log.clone()?.0.swapReservationIndex;
                 let reservation = contract.getReservation(swap_reservation_index).call().await?._0;
                 active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation, None));
+                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation));
                 }).await;
             }
             Some(log) = proof_proposed_stream.next() => {
@@ -211,7 +211,7 @@ pub async fn exchange_event_listener(
                 let swap_reservation_index = log.clone()?.0.swapReservationIndex;
                 let reservation = contract.getReservation(swap_reservation_index).call().await?._0;
                 active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation, None));
+                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation));
                 }).await;
             }
         };
