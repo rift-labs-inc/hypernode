@@ -7,7 +7,7 @@ mod proof_builder;
 
 use clap::Parser;
 use constants::RESERVATION_DURATION_HOURS;
-use core::{ActiveReservations, SafeActiveReservations};
+use core::{Store, ThreadSafeStore};
 use dotenv;
 use eyre::Result;
 use log::{info, trace, warn};
@@ -49,17 +49,24 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)?;
 
-    let safe_active_reservations = Arc::new(SafeActiveReservations::new());
+    let safe_store = Arc::new(ThreadSafeStore::new());
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
         evm_indexer::find_block_height_from_time(&args.evm_ws_rpc, RESERVATION_DURATION_HOURS),
         btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS)
     )?;
 
+    evm_indexer::cache_safe_headers(
+        &args.evm_ws_rpc,
+        &rift_exchange_address,
+        Arc::clone(&safe_store),
+    )
+    .await?;
+
     let synced_evm_height = evm_indexer::sync_reservations(
         &args.evm_ws_rpc,
         &rift_exchange_address,
-        Arc::clone(&safe_active_reservations),
+        Arc::clone(&safe_store),
         start_evm_block_height,
         args.rpc_concurrency,
     )
@@ -70,14 +77,14 @@ async fn main() -> Result<()> {
             &args.evm_ws_rpc,
             rift_exchange_address,
             synced_evm_height,
-            Arc::clone(&safe_active_reservations),
+            Arc::clone(&safe_store),
             args.rpc_concurrency
         ),
         btc_indexer::block_listener(
             &args.btc_rpc,
             start_btc_block_height,
             args.btc_polling_interval,
-            Arc::clone(&safe_active_reservations)
+            Arc::clone(&safe_store)
         )
     )?;
     Ok(())

@@ -2,11 +2,11 @@ use alloy::{
     contract,
     eips::{BlockId, BlockNumberOrTag},
     network::Ethereum,
-    primitives::{Address, U256},
+    primitives::{Address, Bytes, U256},
     providers::{FilterPollerBuilder, Provider, ProviderBuilder, RootProvider, WsConnect},
     pubsub::PubSubFrontend,
     rpc::types::{BlockTransactionsKind, Filter},
-    sol_types::SolEvent,
+    sol_types::{SolEvent, SolValue},
 };
 use eyre::{Result, WrapErr};
 use futures::stream::{self, TryStreamExt};
@@ -18,12 +18,67 @@ use std::{any::Any, collections::HashMap};
 use std::{collections::HashSet, sync::Arc};
 use tokio::time::Duration;
 
-use crate::core::{
-    ReservationMetadata,
-    RiftExchange::{self, RiftExchangeInstance, SwapReservation},
-    SafeActiveReservations,
+use crate::{
+    constants::HEADER_LOOKBACK_LIMIT,
+    core::{
+        BlockHashes, BlockHeaderAggregator, ReservationMetadata,
+        RiftExchange::{self, RiftExchangeInstance, SwapReservation},
+        ThreadSafeStore,
+    },
 };
 use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
+
+fn decode_block_hashes(encoded_blocks: Vec<u8>) -> Result<Vec<[u8; 32]>> {
+    <Vec<Bytes>>::abi_decode(&encoded_blocks, false)?
+        .into_iter()
+        .map(|bytes| {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes);
+            Ok(hash)
+        })
+        .collect()
+}
+
+// get available bitcoin headers stored on the rift exchange contract
+pub async fn cache_safe_headers(
+    ws_rpc_url: &str,
+    rift_exchange_address: &Address,
+    store: Arc<ThreadSafeStore>,
+) -> Result<()> {
+    let provider = ProviderBuilder::new()
+        .on_ws(WsConnect::new(ws_rpc_url))
+        .await?;
+
+    let contract = RiftExchange::new(*rift_exchange_address, &provider);
+
+    let stored_tip = contract.currentHeight().call().await?._0;
+    println!("Stored tip: {:?}", stored_tip);
+
+    let mut heights = (0..HEADER_LOOKBACK_LIMIT)
+        .map(|i| stored_tip.saturating_sub(U256::from(i)))
+        .collect::<Vec<_>>();
+
+    // all the equivalent heights will be grouped, no need to sort
+    heights.dedup();
+
+    let encoded_blocks =
+        BlockHeaderAggregator::deploy_builder(provider, heights.clone(), *rift_exchange_address)
+            .call()
+            .await?;
+
+    let block_hashes =
+        decode_block_hashes(encoded_blocks.to_vec()).wrap_err("Failed to decode block hashes")?;
+
+    store 
+        .with_lock(|store_guard| {
+            for (i, hash) in block_hashes.iter().enumerate() {
+                store_guard.safe_contract_block_hashes.insert(heights[i], *hash);
+            }
+        })
+        .await;
+
+    Ok(())
+}
 
 pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result<u64> {
     let time = Instant::now();
@@ -79,7 +134,7 @@ pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result
 pub async fn sync_reservations(
     ws_rpc_url: &str,
     contract_address: &Address,
-    active_reservations: Arc<SafeActiveReservations>,
+    active_reservations: Arc<ThreadSafeStore>,
     start_block: u64,
     rpc_concurrency: usize,
 ) -> Result<u64> {
@@ -129,10 +184,8 @@ pub async fn sync_reservations(
             async move {
                 let reservation = contract.getReservation(reservation_id).call().await?._0;
 
-                Ok((
-                    reservation_id, 
-                    ReservationMetadata::new(reservation),
-                )) as Result<(U256, ReservationMetadata), contract::Error>
+                Ok((reservation_id, ReservationMetadata::new(reservation)))
+                    as Result<(U256, ReservationMetadata), contract::Error>
             }
         })
         .buffer_unordered(rpc_concurrency)
@@ -155,7 +208,7 @@ pub async fn sync_reservations(
     info!(
         "Synced {} reservations in {:?}",
         total_reservations,
-        time.elapsed() 
+        time.elapsed()
     );
 
     Ok(latest_block)
@@ -165,7 +218,7 @@ pub async fn exchange_event_listener(
     ws_rpc_url: &str,
     contract_address: Address,
     start_index_block_height: u64,
-    active_reservations: Arc<SafeActiveReservations>,
+    active_reservations: Arc<ThreadSafeStore>,
     rpc_concurrency: usize,
 ) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -174,12 +227,28 @@ pub async fn exchange_event_listener(
 
     let contract = RiftExchange::new(contract_address, &provider);
 
-    info!("Rift deployed at: {} on chain ID: {}", contract.address(), &provider.get_chain_id().await?);
+    info!(
+        "Rift deployed at: {} on chain ID: {}",
+        contract.address(),
+        &provider.get_chain_id().await?
+    );
 
     // Create filters for each event.
-    let swap_complete_filter = contract.SwapComplete_filter().from_block(start_index_block_height).watch().await?;
-    let liquidity_reserved_filter = contract.LiquidityReserved_filter().from_block(start_index_block_height).watch().await?;
-    let proof_proposed_filter = contract.ProofProposed_filter().from_block(start_index_block_height).watch().await?;
+    let swap_complete_filter = contract
+        .SwapComplete_filter()
+        .from_block(start_index_block_height)
+        .watch()
+        .await?;
+    let liquidity_reserved_filter = contract
+        .LiquidityReserved_filter()
+        .from_block(start_index_block_height)
+        .watch()
+        .await?;
+    let proof_proposed_filter = contract
+        .ProofProposed_filter()
+        .from_block(start_index_block_height)
+        .watch()
+        .await?;
 
     // Convert the filters into streams.
     let mut swap_complete_stream = swap_complete_filter.into_stream();

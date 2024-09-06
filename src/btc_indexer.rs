@@ -5,7 +5,7 @@ use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block};
 use eyre::Result;
 use log::info;
 
-use crate::{btc_rpc::BitcoinRpcClient, core::SafeActiveReservations};
+use crate::{btc_rpc::BitcoinRpcClient, core::ThreadSafeStore};
 
 fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
     Builder::new()
@@ -17,7 +17,7 @@ fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
 
 async fn analyze_block_for_payments(
     block: &Block,
-    active_reservations: Arc<SafeActiveReservations>,
+    active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
 
     let expected_order_inscriptions = active_reservations
@@ -53,7 +53,7 @@ async fn analyze_block_for_payments(
 
 async fn analyze_reservations_for_sufficient_confirmations(
     block: &Block,
-    active_reservations: Arc<SafeActiveReservations>,
+    active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
     let reservations = active_reservations
         .with_lock(|reservations_guard| {
@@ -107,7 +107,7 @@ pub async fn block_listener(
     rpc_url: &str,
     start_block_height: u64,
     polling_interval: u64,
-    active_reservations: Arc<SafeActiveReservations>,
+    active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
     // user should encode user & pass into rpc url if needed
     let rpc = BitcoinRpcClient::new(rpc_url);

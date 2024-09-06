@@ -7,6 +7,19 @@ use tokio::sync::Mutex;
 sol!(
     #[allow(missing_docs)]
     #[sol(rpc)]
+    BlockHeaderAggregator,
+    "data-aggregation-contracts/out/BlockHeaderAggregator.sol/BlockHeaderAggregator.json"
+);
+
+sol! {
+    struct BlockHashes {
+        bytes[] hashes;
+    }
+}
+
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
     RiftExchange,
     "artifacts/RiftExchange.json"
 );
@@ -68,14 +81,17 @@ impl ReservationMetadata {
     }
 }
 
-pub struct ActiveReservations {
+pub struct Store {
     pub reservations: HashMap<U256, ReservationMetadata>,
+    // Cache available block hashes for building safe -> proposed -> confirmation chains 
+    pub safe_contract_block_hashes: HashMap<U256, [u8; 32]>
 }
 
-impl ActiveReservations {
+impl Store {
     pub fn new() -> Self {
-        ActiveReservations {
+        Store {
             reservations: HashMap::new(),
+            safe_contract_block_hashes: HashMap::new()
         }
     }
 
@@ -123,37 +139,37 @@ impl ActiveReservations {
     }
 }
 
-pub struct ActiveReservationsGuard<'a> {
-    guard: tokio::sync::MutexGuard<'a, ActiveReservations>,
+pub struct StoreGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, Store>,
 }
 
-impl<'a> std::ops::Deref for ActiveReservationsGuard<'a> {
-    type Target = ActiveReservations;
+impl<'a> std::ops::Deref for StoreGuard<'a> {
+    type Target = Store;
 
     fn deref(&self) -> &Self::Target {
         &self.guard
     }
 }
 
-impl<'a> std::ops::DerefMut for ActiveReservationsGuard<'a> {
+impl<'a> std::ops::DerefMut for StoreGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
     }
 }
 
-pub struct SafeActiveReservations(Arc<Mutex<ActiveReservations>>);
+pub struct ThreadSafeStore(Arc<Mutex<Store>>);
 
-impl SafeActiveReservations {
+impl ThreadSafeStore {
     pub fn new() -> Self {
-        SafeActiveReservations(Arc::new(Mutex::new(ActiveReservations::new())))
+        ThreadSafeStore(Arc::new(Mutex::new(Store::new())))
     }
 
     pub async fn with_lock<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut ActiveReservationsGuard<'_>) -> R,
+        F: FnOnce(&mut StoreGuard<'_>) -> R,
     {
         let guard = self.0.lock().await;
-        let mut reservations_guard = ActiveReservationsGuard { guard };
+        let mut reservations_guard = StoreGuard { guard };
         f(&mut reservations_guard)
     }
 }

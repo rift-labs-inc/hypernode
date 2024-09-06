@@ -1,1 +1,2 @@
 pub const RESERVATION_DURATION_HOURS: u64 = 8;
+pub const HEADER_LOOKBACK_LIMIT: u64 = 5;
