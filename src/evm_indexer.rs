@@ -52,7 +52,6 @@ pub async fn cache_safe_headers(
     let contract = RiftExchange::new(*rift_exchange_address, &provider);
 
     let stored_tip = contract.currentHeight().call().await?._0;
-    println!("Stored tip: {:?}", stored_tip);
 
     let mut heights = (0..HEADER_LOOKBACK_LIMIT)
         .map(|i| stored_tip.saturating_sub(U256::from(i)))
@@ -60,6 +59,7 @@ pub async fn cache_safe_headers(
 
     // all the equivalent heights will be grouped, no need to sort
     heights.dedup();
+
 
     let encoded_blocks =
         BlockHeaderAggregator::deploy_builder(provider, heights.clone(), *rift_exchange_address)
@@ -72,6 +72,9 @@ pub async fn cache_safe_headers(
     store 
         .with_lock(|store_guard| {
             for (i, hash) in block_hashes.iter().enumerate() {
+                if hash == &[0u8; 32] {
+                    continue;
+                }
                 store_guard.safe_contract_block_hashes.insert(heights[i], *hash);
             }
         })
