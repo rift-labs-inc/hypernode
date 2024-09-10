@@ -3,12 +3,14 @@ use futures_util::stream;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bitcoin::{hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, script::Builder, Block};
+use bitcoin::consensus::serialize;
+use bitcoin::{hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, psbt::serialize, script::Builder, Block, Transaction};
 use eyre::Result;
 use log::info;
 
 use crate::{
-    btc_rpc::BitcoinRpcClient, constants::CONFIRMATION_HEIGHT_DELTA, core::ThreadSafeStore, proof_builder,
+    btc_rpc::BitcoinRpcClient, constants::CONFIRMATION_HEIGHT_DELTA, core::ThreadSafeStore,
+    proof_builder,
 };
 
 fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
@@ -47,6 +49,7 @@ async fn analyze_block_for_payments(
                         tx.compute_txid(),
                         block_height
                     );
+                    println!("tx bytes: {}", serialize::<Transaction>(&tx).to_lower_hex_string());
                     active_reservations
                         .with_lock(|reservations_guard| {
                             reservations_guard.update_btc_reservation_initial(
@@ -77,12 +80,10 @@ async fn analyze_reservations_for_sufficient_confirmations(
                 .reservations
                 .iter()
                 .filter_map(|(id, metadata)| {
-                    metadata
-                        .btc_final
-                        .as_ref()
-                        .is_some()
-                        .then(|| Some((id.clone(), metadata.clone())))
-                        .unwrap_or(None)
+                    (metadata.btc_initial.as_ref().is_some()
+                        && metadata.btc_final.as_ref().is_none())
+                    .then(|| Some((id.clone(), metadata.clone())))
+                    .unwrap_or(None)
                 })
                 .collect::<Vec<_>>()
         })
@@ -95,6 +96,7 @@ async fn analyze_reservations_for_sufficient_confirmations(
     let current_btc_block_height = block.bip34_block_height()? as u64;
     let mut available_btc_heights = header_contract_btc_block_hashes.keys().collect::<Vec<_>>();
     available_btc_heights.sort();
+
     let current_tip = available_btc_heights.last().unwrap();
     for (id, reservation_metadata) in pending_confirmation_reservations {
         let btc_initial_metadata = reservation_metadata.btc_initial.unwrap();
@@ -124,7 +126,7 @@ async fn analyze_reservations_for_sufficient_confirmations(
 
         let min_confirmation_height =
             btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA;
-
+        
         // it's possible that the actual btc chain has enough confirmations but the contract chain
         // does not, in that case, we provide the actual + CONFIRMATION_HEIGHT_DELTA block as the
         // confirmation height b/c the contract chain doesn't have enough blocks yet
@@ -132,7 +134,7 @@ async fn analyze_reservations_for_sufficient_confirmations(
             match available_btc_heights.binary_search(&&min_confirmation_height) {
                 Ok(index) => available_btc_heights[index],
                 Err(index) => {
-                    if index == available_btc_heights.len() - 1 {
+                    if index == available_btc_heights.len() {
                         // All available heights are smaller than min_confirmation_height
                         &min_confirmation_height
                     } else {
@@ -178,8 +180,10 @@ async fn analyze_reservations_for_sufficient_confirmations(
                 );
             })
             .await;
+        
 
         // add it the proof gen queue
+        info!("Adding reservation: {} to proof generation queue", id);
         proof_gen_queue.add(proof_builder::ProofGenerationInput::new(id.clone()));
     }
 
@@ -226,6 +230,7 @@ pub async fn block_listener(
     start_block_height: u64,
     polling_interval: u64,
     active_reservations: Arc<ThreadSafeStore>,
+    proof_gen_queue: Arc<proof_builder::ProofGenerationQueue>,
 ) -> Result<()> {
     // user should encode user & pass into rpc url if needed
     let rpc = BitcoinRpcClient::new(rpc_url);
@@ -242,7 +247,13 @@ pub async fn block_listener(
                 .await?;
 
             analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
-            analyze_reservations_for_sufficient_confirmations(&block, Arc::clone(&active_reservations), &rpc).await?;
+            analyze_reservations_for_sufficient_confirmations(
+                &block,
+                Arc::clone(&active_reservations),
+                &rpc,
+                Arc::clone(&proof_gen_queue),
+            )
+            .await?;
 
             let blocks_synced = analyzed_height - start_block_height + 1;
             let progress_percentage = (blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0;

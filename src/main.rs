@@ -50,15 +50,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)?;
 
-    let proof_gen_queue = proof_builder::ProofGenerationQueue::new(Arc::new(ThreadSafeStore::new()));
-
     let safe_store = Arc::new(ThreadSafeStore::new());
+
+    let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(Arc::clone(
+        &safe_store,
+    )));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
         evm_indexer::find_block_height_from_time(&args.evm_ws_rpc, RESERVATION_DURATION_HOURS),
         btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS)
     )?;
-
 
     let synced_reservation_evm_height = evm_indexer::sync_reservations(
         &args.evm_ws_rpc,
@@ -69,13 +70,12 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-
     let synced_block_header_evm_height = evm_indexer::download_safe_bitcoin_headers(
         &args.evm_ws_rpc,
         &rift_exchange_address,
         Arc::clone(&safe_store),
         None,
-        None
+        None,
     )
     .await?;
 
@@ -91,7 +91,8 @@ async fn main() -> Result<()> {
             &args.btc_rpc,
             start_btc_block_height,
             args.btc_polling_interval,
-            Arc::clone(&safe_store)
+            Arc::clone(&safe_store),
+            Arc::clone(&proof_gen_queue)
         )
     )?;
     Ok(())

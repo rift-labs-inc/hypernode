@@ -29,7 +29,12 @@ use crate::{
 use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
 
 fn decode_vaults(encoded_vaults: Vec<u8>) -> Result<Vec<RiftExchange::DepositVault>> {
-    Vec::<RiftExchange::DepositVault>::abi_decode(&encoded_vaults, false).map_err(|e| e.into())
+    let encoded_vaults = Vec::<Bytes>::abi_decode(&encoded_vaults, false).map_err(|_| eyre::eyre!("Failed to decode vault byte array"))?;
+    encoded_vaults.into_iter().map(|bytes| {
+        let vault = RiftExchange::DepositVault::abi_decode(&bytes.to_vec(), false)
+            .map_err(|e| eyre::eyre!("Failed to decode deposit vault: {}", e))?;
+        Ok(vault)
+    }).collect()
 }
 
 pub async fn download_vaults(
@@ -49,7 +54,8 @@ pub async fn download_vaults(
     .call()
     .await?;
 
-    decode_vaults(encoded_vaults.to_vec()).wrap_err("Failed to decode vaults")
+    let vaults = decode_vaults(encoded_vaults.to_vec()).wrap_err("Failed to decode vaults")?;
+    Ok(vaults)
 }
 
 fn decode_block_hashes(encoded_blocks: Vec<u8>) -> Result<Vec<[u8; 32]>> {
@@ -80,8 +86,9 @@ pub async fn download_safe_bitcoin_headers(
 
     let stored_tip = match end_block_height {
         Some(height) => height,
-        None => u64::from_be_bytes(contract.currentHeight().call().await?._0.to_be_bytes()),
+        None => u64::from_be_bytes(contract.currentHeight().call().await?._0.to_be_bytes::<32>()[32-8..].try_into().unwrap()),
     };
+
 
     let lookback_limit = lookback_count.unwrap_or(HEADER_LOOKBACK_LIMIT);
 
@@ -108,7 +115,7 @@ pub async fn download_safe_bitcoin_headers(
                 }
                 store_guard
                     .safe_contract_block_hashes
-                    .insert(u64::from_be_bytes(heights[i].to_be_bytes()), *hash);
+                    .insert(u64::from_be_bytes(heights[i].to_be_bytes::<32>()[32-8..].try_into().unwrap()), *hash);
             }
         })
         .await;
@@ -144,11 +151,7 @@ pub async fn download_reservation(
         .vaultIndexes
         .iter()
         .map(|index| {
-            let bytes = index.to_be_bytes_trimmed_vec();
-            let mut array = [0u8; 4];
-            let len = bytes.len().min(4);
-            array[..len].copy_from_slice(&bytes[..len]);
-            u32::from_be_bytes(array)
+            u32::from_be_bytes(index.to_be_bytes::<32>()[32-4..].try_into().unwrap())
         })
         .collect();
 
@@ -381,7 +384,7 @@ pub async fn exchange_event_listener(
             Some(log) = blocks_added_stream.next() => {
                 let blocks_added = log.clone()?.0;
                 let count = blocks_added.count;
-                let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes());
+                let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes::<32>()[32-8..].try_into().unwrap());
                 info!("BlocksAdded w/ confirmation height: {:?} and safe height: {:?}", end_block_height, blocks_added.startBlockHeight);
                 download_safe_bitcoin_headers(ws_rpc_url, &contract_address, Arc::clone(&active_reservations), Some(end_block_height), Some(usize::from_be_bytes(blocks_added.count.to_be_bytes()))).await?;
             }
