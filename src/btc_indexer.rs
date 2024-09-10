@@ -1,31 +1,38 @@
+use futures::StreamExt;
+use futures_util::stream;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block};
+use bitcoin::{hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, script::Builder, Block};
 use eyre::Result;
 use log::info;
 
-use crate::{btc_rpc::BitcoinRpcClient, core::ThreadSafeStore};
+use crate::{
+    btc_rpc::BitcoinRpcClient, constants::CONFIRMATION_HEIGHT_DELTA, core::ThreadSafeStore, proof_builder,
+};
 
 fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
     Builder::new()
         .push_opcode(OP_RETURN)
         .push_slice(&order_nonce)
-        .into_script().into_bytes()
+        .into_script()
+        .into_bytes()
 }
-
 
 async fn analyze_block_for_payments(
     block: &Block,
     active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
-
     let expected_order_inscriptions = active_reservations
         .with_lock(|reservations_guard| {
-            reservations_guard.reservations.iter().map(|(id, metadata)| {
-                let script = build_rift_inscription(metadata.reservation.nonce.0);
-                (id.clone(), script)
-            }).collect::<Vec<_>>()
+            reservations_guard
+                .reservations
+                .iter()
+                .map(|(id, metadata)| {
+                    let script = build_rift_inscription(metadata.reservation.nonce.0);
+                    (id.clone(), script)
+                })
+                .collect::<Vec<_>>()
         })
         .await;
 
@@ -34,15 +41,22 @@ async fn analyze_block_for_payments(
             for (id, expected_script) in expected_order_inscriptions.iter() {
                 if script.as_bytes() == expected_script {
                     let block_height = block.bip34_block_height()? as u64;
-                    info!("Found payment for reservation: {}, txid: {} at block height: {}", id, tx.compute_txid(), block_height);
-                    active_reservations.with_lock(|reservations_guard| {
-                        reservations_guard.update_btc_reservation(
-                            *id,
-                            block_height,
-                            *block.block_hash().as_raw_hash().as_byte_array(),
-                            *tx.compute_txid().as_byte_array(),
-                        );
-                    }).await;
+                    info!(
+                        "Found payment for reservation: {}, txid: {} at block height: {}",
+                        id,
+                        tx.compute_txid(),
+                        block_height
+                    );
+                    active_reservations
+                        .with_lock(|reservations_guard| {
+                            reservations_guard.update_btc_reservation_initial(
+                                *id,
+                                block_height,
+                                *block.block_hash().as_raw_hash().as_byte_array(),
+                                *tx.compute_txid().as_byte_array(),
+                            );
+                        })
+                        .await;
                 }
             }
         }
@@ -54,17 +68,121 @@ async fn analyze_block_for_payments(
 async fn analyze_reservations_for_sufficient_confirmations(
     block: &Block,
     active_reservations: Arc<ThreadSafeStore>,
+    rpc_client: &BitcoinRpcClient,
+    proof_gen_queue: Arc<proof_builder::ProofGenerationQueue>,
 ) -> Result<()> {
-    let reservations = active_reservations
+    let pending_confirmation_reservations = active_reservations
         .with_lock(|reservations_guard| {
-            reservations_guard.reservations.iter().map(|(id, metadata)| {
-                (id.clone(), metadata.btc.clone())
-            }).collect::<Vec<_>>()
+            reservations_guard
+                .reservations
+                .iter()
+                .filter_map(|(id, metadata)| {
+                    metadata
+                        .btc_final
+                        .as_ref()
+                        .is_some()
+                        .then(|| Some((id.clone(), metadata.clone())))
+                        .unwrap_or(None)
+                })
+                .collect::<Vec<_>>()
         })
         .await;
-    
-    // 
-    
+
+    let header_contract_btc_block_hashes = active_reservations
+        .with_lock(|reservations_guard| reservations_guard.safe_contract_block_hashes.clone())
+        .await;
+
+    let current_btc_block_height = block.bip34_block_height()? as u64;
+    let mut available_btc_heights = header_contract_btc_block_hashes.keys().collect::<Vec<_>>();
+    available_btc_heights.sort();
+    let current_tip = available_btc_heights.last().unwrap();
+    for (id, reservation_metadata) in pending_confirmation_reservations {
+        let btc_initial_metadata = reservation_metadata.btc_initial.unwrap();
+        if btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA
+            > current_btc_block_height
+        {
+            info!(
+                "Reservation: {} not confirmed yet, need {} more confirmations",
+                id,
+                btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA
+                    - current_btc_block_height
+            );
+            // not enough confirmations yet
+            continue;
+        }
+        // If here, this reservation can be considered confirmed, it's confirmation height may be
+        // behind the current tip so in that case, we need to find the closest available block to
+        // the right of the proposed block height + CONFIRMATION_HEIGHT_DELTA (min of 5)
+        // use binary search to find an available block height that is greater than or equal to the proposed block height
+        let safe_height_index = match available_btc_heights
+            .binary_search(&&btc_initial_metadata.proposed_block_height)
+        {
+            Ok(index) => index - 1,
+            Err(index) => index - 1,
+        };
+        let safe_height = available_btc_heights[safe_height_index];
+
+        let min_confirmation_height =
+            btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA;
+
+        // it's possible that the actual btc chain has enough confirmations but the contract chain
+        // does not, in that case, we provide the actual + CONFIRMATION_HEIGHT_DELTA block as the
+        // confirmation height b/c the contract chain doesn't have enough blocks yet
+        let confirmation_height =
+            match available_btc_heights.binary_search(&&min_confirmation_height) {
+                Ok(index) => available_btc_heights[index],
+                Err(index) => {
+                    if index == available_btc_heights.len() - 1 {
+                        // All available heights are smaller than min_confirmation_height
+                        &min_confirmation_height
+                    } else {
+                        // The closest available height to the right of min_confirmation_height
+                        available_btc_heights[index]
+                    }
+                }
+            };
+
+        // TODO: download the block headers from the safe block height to the confirmation height
+
+        let blocks: Vec<Block> = stream::iter(*safe_height..*confirmation_height)
+            .map(|height| async move {
+                let block_hash = rpc_client.get_block_hash(height).await.map_err(|e| {
+                    eyre::eyre!("Failed to get block hash for height {}: {}", height, e)
+                })?;
+
+                let block = rpc_client.get_block(&block_hash).await.map_err(|e| {
+                    eyre::eyre!(
+                        "Failed to get block for hash {}: {}",
+                        block_hash.to_hex_string(bitcoin::hex::Case::Lower),
+                        e
+                    )
+                })?;
+                Ok(block)
+            })
+            .buffered(10)
+            .collect::<Vec<Result<Block>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        let blocks = blocks.into_iter().collect::<Vec<_>>();
+
+        active_reservations
+            .with_lock(|reservations_guard| {
+                reservations_guard.update_btc_reservation_final(
+                    id.clone(),
+                    *confirmation_height,
+                    *block.block_hash().as_raw_hash().as_byte_array(),
+                    blocks,
+                    block.clone(),
+                );
+            })
+            .await;
+
+        // add it the proof gen queue
+        proof_gen_queue.add(proof_builder::ProofGenerationInput::new(id.clone()));
+    }
+
     Ok(())
 }
 
@@ -122,9 +240,10 @@ pub async fn block_listener(
             let block = rpc
                 .get_block(&rpc.get_block_hash(analyzed_height).await?)
                 .await?;
-            
+
             analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
-            
+            analyze_reservations_for_sufficient_confirmations(&block, Arc::clone(&active_reservations), &rpc).await?;
+
             let blocks_synced = analyzed_height - start_block_height + 1;
             let progress_percentage = (blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0;
             info!(
@@ -140,7 +259,10 @@ pub async fn block_listener(
                 current_height = new_height;
                 // Update total_blocks_to_sync for accurate percentage calculation
                 total_blocks_to_sync = current_height - start_block_height + 1;
-                info!("New blocks found. Continuing sync to new tip: {}", current_height);
+                info!(
+                    "New blocks found. Continuing sync to new tip: {}",
+                    current_height
+                );
                 fully_synced_logged = false;
             } else if !fully_synced_logged {
                 // we're fully synced, log only if not logged before

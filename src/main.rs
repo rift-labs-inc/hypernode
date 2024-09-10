@@ -24,6 +24,7 @@ struct Args {
     /// Bitcoin RPC URL for indexing
     #[arg(short, long, env)]
     btc_rpc: String,
+
     /// Rift Exchange contract address
     #[arg(short, long, env)]
     rift_exchange_address: String,
@@ -49,6 +50,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)?;
 
+    let proof_gen_queue = proof_builder::ProofGenerationQueue::new(Arc::new(ThreadSafeStore::new()));
+
     let safe_store = Arc::new(ThreadSafeStore::new());
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
@@ -56,14 +59,8 @@ async fn main() -> Result<()> {
         btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS)
     )?;
 
-    evm_indexer::cache_safe_headers(
-        &args.evm_ws_rpc,
-        &rift_exchange_address,
-        Arc::clone(&safe_store),
-    )
-    .await?;
 
-    let synced_evm_height = evm_indexer::sync_reservations(
+    let synced_reservation_evm_height = evm_indexer::sync_reservations(
         &args.evm_ws_rpc,
         &rift_exchange_address,
         Arc::clone(&safe_store),
@@ -72,13 +69,23 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+
+    let synced_block_header_evm_height = evm_indexer::download_safe_bitcoin_headers(
+        &args.evm_ws_rpc,
+        &rift_exchange_address,
+        Arc::clone(&safe_store),
+        None,
+        None
+    )
+    .await?;
+
     tokio::try_join!(
         evm_indexer::exchange_event_listener(
             &args.evm_ws_rpc,
             rift_exchange_address,
-            synced_evm_height,
-            Arc::clone(&safe_store),
-            args.rpc_concurrency
+            synced_reservation_evm_height,
+            synced_block_header_evm_height,
+            Arc::clone(&safe_store)
         ),
         btc_indexer::block_listener(
             &args.btc_rpc,

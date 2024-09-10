@@ -1,5 +1,6 @@
 use alloy::primitives::U256;
 use alloy::sol;
+use bitcoin::Block;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -9,6 +10,13 @@ sol!(
     #[sol(rpc)]
     BlockHeaderAggregator,
     "data-aggregation-contracts/out/BlockHeaderAggregator.sol/BlockHeaderAggregator.json"
+);
+
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    DepositVaultAggregator,
+    "data-aggregation-contracts/out/DepositVaultsAggregator.sol/DepositVaultsAggregator.json"
 );
 
 sol! {
@@ -39,25 +47,26 @@ sol!(
 );
 
 #[derive(Clone)]
+pub struct BitcoinReservationFinalized {
+    pub confirmation_height: u64,
+    pub confirmation_block_hash: [u8; 32],
+    pub blocks: Vec<Block>,
+    pub retarget_block: Block,
+}
+
+#[derive(Clone)]
 pub struct BitcoinReservationInProgress {
     pub proposed_block_height: u64,
     pub proposed_block_hash: [u8; 32],
     pub txid: [u8; 32],
-    pub confirmation_height: Option<u64>,
-    pub confirmation_block_hash: Option<[u8; 32]>
 }
+
 impl BitcoinReservationInProgress {
-    pub fn new(
-        proposed_block_height: u64,
-        proposed_block_hash: [u8; 32],
-        txid: [u8; 32],
-    ) -> Self {
+    pub fn new(proposed_block_height: u64, proposed_block_hash: [u8; 32], txid: [u8; 32]) -> Self {
         BitcoinReservationInProgress {
             proposed_block_height,
             proposed_block_hash,
             txid,
-            confirmation_height: None,
-            confirmation_block_hash: None,
         }
     }
 }
@@ -67,31 +76,36 @@ impl BitcoinReservationInProgress {
 #[derive(Clone)]
 pub struct ReservationMetadata {
     pub reservation: RiftExchange::SwapReservation,
-    pub btc: Option<BitcoinReservationInProgress>,
+    pub reserved_vaults: Vec<RiftExchange::DepositVault>,
+    pub btc_initial: Option<BitcoinReservationInProgress>,
+    pub btc_final: Option<BitcoinReservationFinalized>,
 }
 
 impl ReservationMetadata {
     pub fn new(
         reservation: RiftExchange::SwapReservation,
+        reserved_vaults: Vec<RiftExchange::DepositVault>,
     ) -> Self {
         ReservationMetadata {
             reservation,
-            btc: None,
+            reserved_vaults,
+            btc_initial: None,
+            btc_final: None,
         }
     }
 }
 
 pub struct Store {
     pub reservations: HashMap<U256, ReservationMetadata>,
-    // Cache available block hashes for building safe -> proposed -> confirmation chains 
-    pub safe_contract_block_hashes: HashMap<U256, [u8; 32]>
+    // Cache available block hashes for building safe -> proposed -> confirmation chains
+    pub safe_contract_block_hashes: HashMap<u64, [u8; 32]>,
 }
 
 impl Store {
     pub fn new() -> Self {
         Store {
             reservations: HashMap::new(),
-            safe_contract_block_hashes: HashMap::new()
+            safe_contract_block_hashes: HashMap::new(),
         }
     }
 
@@ -110,7 +124,7 @@ impl Store {
         }
     }
 
-    pub fn update_btc_reservation(
+    pub fn update_btc_reservation_initial(
         &mut self,
         id: U256,
         proposed_block_height: u64,
@@ -118,11 +132,28 @@ impl Store {
         txid: [u8; 32],
     ) {
         let metadata = self.reservations.get_mut(&id).unwrap();
-        metadata.btc = Some(BitcoinReservationInProgress::new(
+        metadata.btc_initial = Some(BitcoinReservationInProgress::new(
             proposed_block_height,
             proposed_block_hash,
             txid,
         ));
+    }
+
+    pub fn update_btc_reservation_final(
+        &mut self,
+        id: U256,
+        confirmation_height: u64,
+        confirmation_block_hash: [u8; 32],
+        blocks: Vec<Block>,
+        retarget_block: Block,
+    ) {
+        let metadata = self.reservations.get_mut(&id).unwrap();
+        metadata.btc_final = Some(BitcoinReservationFinalized {
+            confirmation_height,
+            confirmation_block_hash,
+            blocks,
+            retarget_block,
+        });
     }
 
     pub fn insert(&mut self, swap_reservation_index: U256, reservation: ReservationMetadata) {

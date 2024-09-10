@@ -21,12 +21,36 @@ use tokio::time::Duration;
 use crate::{
     constants::HEADER_LOOKBACK_LIMIT,
     core::{
-        BlockHashes, BlockHeaderAggregator, ReservationMetadata,
+        BlockHashes, BlockHeaderAggregator, DepositVaultAggregator, ReservationMetadata,
         RiftExchange::{self, RiftExchangeInstance, SwapReservation},
         ThreadSafeStore,
     },
 };
 use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
+
+fn decode_vaults(encoded_vaults: Vec<u8>) -> Result<Vec<RiftExchange::DepositVault>> {
+    Vec::<RiftExchange::DepositVault>::abi_decode(&encoded_vaults, false).map_err(|e| e.into())
+}
+
+pub async fn download_vaults(
+    ws_rpc_url: &str,
+    rift_exchange_address: &Address,
+    vault_indices: Vec<u32>,
+) -> Result<Vec<RiftExchange::DepositVault>> {
+    let provider = ProviderBuilder::new()
+        .on_ws(WsConnect::new(ws_rpc_url))
+        .await?;
+
+    let encoded_vaults = DepositVaultAggregator::deploy_builder(
+        provider,
+        vault_indices.clone(),
+        *rift_exchange_address,
+    )
+    .call()
+    .await?;
+
+    decode_vaults(encoded_vaults.to_vec()).wrap_err("Failed to decode vaults")
+}
 
 fn decode_block_hashes(encoded_blocks: Vec<u8>) -> Result<Vec<[u8; 32]>> {
     <Vec<Bytes>>::abi_decode(&encoded_blocks, false)?
@@ -40,26 +64,33 @@ fn decode_block_hashes(encoded_blocks: Vec<u8>) -> Result<Vec<[u8; 32]>> {
 }
 
 // get available bitcoin headers stored on the rift exchange contract
-pub async fn cache_safe_headers(
+pub async fn download_safe_bitcoin_headers(
     ws_rpc_url: &str,
     rift_exchange_address: &Address,
     store: Arc<ThreadSafeStore>,
-) -> Result<()> {
+    end_block_height: Option<u64>,
+    lookback_count: Option<usize>,
+) -> Result<u64> {
     let provider = ProviderBuilder::new()
         .on_ws(WsConnect::new(ws_rpc_url))
         .await?;
 
     let contract = RiftExchange::new(*rift_exchange_address, &provider);
+    let current_evm_tip = provider.get_block_number().await?;
 
-    let stored_tip = contract.currentHeight().call().await?._0;
+    let stored_tip = match end_block_height {
+        Some(height) => height,
+        None => u64::from_be_bytes(contract.currentHeight().call().await?._0.to_be_bytes()),
+    };
 
-    let mut heights = (0..HEADER_LOOKBACK_LIMIT)
-        .map(|i| stored_tip.saturating_sub(U256::from(i)))
+    let lookback_limit = lookback_count.unwrap_or(HEADER_LOOKBACK_LIMIT);
+
+    let mut heights = (0..lookback_limit)
+        .map(|i| U256::from(stored_tip).saturating_sub(U256::from(i)))
         .collect::<Vec<_>>();
 
     // all the equivalent heights will be grouped, no need to sort
     heights.dedup();
-
 
     let encoded_blocks =
         BlockHeaderAggregator::deploy_builder(provider, heights.clone(), *rift_exchange_address)
@@ -69,18 +100,69 @@ pub async fn cache_safe_headers(
     let block_hashes =
         decode_block_hashes(encoded_blocks.to_vec()).wrap_err("Failed to decode block hashes")?;
 
-    store 
+    store
         .with_lock(|store_guard| {
             for (i, hash) in block_hashes.iter().enumerate() {
                 if hash == &[0u8; 32] {
                     continue;
                 }
-                store_guard.safe_contract_block_hashes.insert(heights[i], *hash);
+                store_guard
+                    .safe_contract_block_hashes
+                    .insert(u64::from_be_bytes(heights[i].to_be_bytes()), *hash);
             }
         })
         .await;
 
-    Ok(())
+    Ok(current_evm_tip)
+}
+
+// Downloads the actual reservation struct and all utilized deposit vaults
+pub async fn download_reservation(
+    reservation_id: U256,
+    ws_rpc_url: &str,
+    contract_address: &Address,
+) -> Result<(U256, ReservationMetadata)> {
+    let provider = ProviderBuilder::new()
+        .on_ws(WsConnect::new(ws_rpc_url))
+        .await?;
+
+    let contract = RiftExchange::new(*contract_address, &provider);
+
+    let reservation = match contract.getReservation(reservation_id).call().await {
+        Ok(res) => res._0,
+        Err(e) => {
+            return Err(eyre::eyre!(
+                "Failed to get reservation with ID {:?}: {}",
+                reservation_id,
+                e
+            )
+            .into());
+        }
+    };
+
+    let vault_indexes: Vec<u32> = reservation
+        .vaultIndexes
+        .iter()
+        .map(|index| {
+            let bytes = index.to_be_bytes_trimmed_vec();
+            let mut array = [0u8; 4];
+            let len = bytes.len().min(4);
+            array[..len].copy_from_slice(&bytes[..len]);
+            u32::from_be_bytes(array)
+        })
+        .collect();
+
+    match download_vaults(ws_rpc_url, contract_address, vault_indexes).await {
+        Ok(vaults) => {
+            // TODO: download liquidity providers and store them, also abstract out this logic to a
+            // function that can be used here and in the listener
+            Ok((
+                reservation_id,
+                ReservationMetadata::new(reservation, vaults),
+            ))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result<u64> {
@@ -185,15 +267,18 @@ pub async fn sync_reservations(
         .map(|reservation_id| {
             let contract = Arc::clone(&contract);
             async move {
-                let reservation = contract.getReservation(reservation_id).call().await?._0;
-
-                Ok((reservation_id, ReservationMetadata::new(reservation)))
-                    as Result<(U256, ReservationMetadata), contract::Error>
+                download_reservation(reservation_id, ws_rpc_url, contract.address())
+                    .await
+                    .map_err(|e| {
+                        info!("Failed to download reservation: {}", e);
+                        e
+                    })
             }
         })
         .buffer_unordered(rpc_concurrency)
         .try_collect()
-        .await?;
+        .await
+        .map_err(|e: eyre::Report| e)?;
 
     let total_reservations = &reservations.len();
 
@@ -221,8 +306,8 @@ pub async fn exchange_event_listener(
     ws_rpc_url: &str,
     contract_address: Address,
     start_index_block_height: u64,
+    start_block_header_height: u64,
     active_reservations: Arc<ThreadSafeStore>,
-    rpc_concurrency: usize,
 ) -> Result<()> {
     let provider = ProviderBuilder::new()
         .on_ws(WsConnect::new(ws_rpc_url))
@@ -253,10 +338,17 @@ pub async fn exchange_event_listener(
         .watch()
         .await?;
 
+    let blocks_added_filter = contract
+        .BlocksAdded_filter()
+        .from_block(start_block_header_height)
+        .watch()
+        .await?;
+
     // Convert the filters into streams.
     let mut swap_complete_stream = swap_complete_filter.into_stream();
     let mut liquidity_reserved_stream = liquidity_reserved_filter.into_stream();
     let mut proof_proposed_stream = proof_proposed_filter.into_stream();
+    let mut blocks_added_stream = blocks_added_filter.into_stream();
 
     // Use tokio::select! to multiplex the streams and capture the log
     // tokio::select! will return the first event that arrives from any of the streams
@@ -273,18 +365,25 @@ pub async fn exchange_event_listener(
             Some(log) = liquidity_reserved_stream.next() => {
                 info!("LiquidityReserved w/ reservation index: {:?}", &log.clone()?.0.swapReservationIndex);
                 let swap_reservation_index = log.clone()?.0.swapReservationIndex;
-                let reservation = contract.getReservation(swap_reservation_index).call().await?._0;
+                let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
                 active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation));
+                    reservations_guard.insert(swap_reservation_index, reservation.1);
                 }).await;
             }
             Some(log) = proof_proposed_stream.next() => {
                 info!("ProofProposed w/ reservation index: {:?}", &log.clone()?.0.swapReservationIndex);
                 let swap_reservation_index = log.clone()?.0.swapReservationIndex;
-                let reservation = contract.getReservation(swap_reservation_index).call().await?._0;
+                let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
                 active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.insert(swap_reservation_index, ReservationMetadata::new(reservation));
+                    reservations_guard.insert(swap_reservation_index, reservation.1);
                 }).await;
+            }
+            Some(log) = blocks_added_stream.next() => {
+                let blocks_added = log.clone()?.0;
+                let count = blocks_added.count;
+                let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes());
+                info!("BlocksAdded w/ confirmation height: {:?} and safe height: {:?}", end_block_height, blocks_added.startBlockHeight);
+                download_safe_bitcoin_headers(ws_rpc_url, &contract_address, Arc::clone(&active_reservations), Some(end_block_height), Some(usize::from_be_bytes(blocks_added.count.to_be_bytes()))).await?;
             }
         };
     }
