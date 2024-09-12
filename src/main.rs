@@ -9,6 +9,7 @@ use clap::Parser;
 use constants::RESERVATION_DURATION_HOURS;
 use core::{Store, ThreadSafeStore};
 use dotenv;
+use evm_indexer::fetch_token_decimals;
 use eyre::Result;
 use log::{info, trace, warn};
 use std::{str::FromStr, sync::Arc};
@@ -52,9 +53,13 @@ async fn main() -> Result<()> {
 
     let safe_store = Arc::new(ThreadSafeStore::new());
 
-    let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(Arc::clone(
-        &safe_store,
-    )));
+    let underyling_token_decimals =
+        fetch_token_decimals(&args.evm_ws_rpc, &rift_exchange_address).await?;
+
+    let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(
+        Arc::clone(&safe_store),
+        underyling_token_decimals,
+    ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
         evm_indexer::find_block_height_from_time(&args.evm_ws_rpc, RESERVATION_DURATION_HOURS),

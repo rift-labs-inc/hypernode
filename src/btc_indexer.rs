@@ -49,7 +49,6 @@ async fn analyze_block_for_payments(
                         tx.compute_txid(),
                         block_height
                     );
-                    println!("tx bytes: {}", serialize::<Transaction>(&tx).to_lower_hex_string());
                     active_reservations
                         .with_lock(|reservations_guard| {
                             reservations_guard.update_btc_reservation_initial(

@@ -16,6 +16,7 @@ use std::error::Error;
 use std::time::{Instant, UNIX_EPOCH};
 use std::{any::Any, collections::HashMap};
 use std::{collections::HashSet, sync::Arc};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use crate::{
@@ -27,6 +28,19 @@ use crate::{
     },
 };
 use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
+
+
+pub async fn fetch_token_decimals(
+    ws_rpc_url: &str,
+    rift_exchange_address: &Address,
+) -> Result<u8> {
+    let provider = ProviderBuilder::new()
+        .on_ws(WsConnect::new(ws_rpc_url))
+        .await?;
+
+    let rift_exchange = RiftExchange::new(*rift_exchange_address, &provider);
+    Ok(rift_exchange.TOKEN_DECIMALS().call().await?._0)
+}
 
 fn decode_vaults(encoded_vaults: Vec<u8>) -> Result<Vec<RiftExchange::DepositVault>> {
     let encoded_vaults = Vec::<Bytes>::abi_decode(&encoded_vaults, false).map_err(|_| eyre::eyre!("Failed to decode vault byte array"))?;
@@ -353,40 +367,83 @@ pub async fn exchange_event_listener(
     let mut proof_proposed_stream = proof_proposed_filter.into_stream();
     let mut blocks_added_stream = blocks_added_filter.into_stream();
 
-    // Use tokio::select! to multiplex the streams and capture the log
-    // tokio::select! will return the first event that arrives from any of the streams
-    // The for loop helps capture all the logs.
+    // Use a HashSet to keep track of already-processed logs
+    let processed_logs = Arc::new(Mutex::new(HashSet::new()));
+
     loop {
         tokio::select! {
             Some(log) = swap_complete_stream.next() => {
-                let swap_reservation_index = log.clone()?.0.swapReservationIndex;
-                info!("SwapComplete with reservation index: {:?}", &swap_reservation_index);
-                active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.remove(swap_reservation_index);
-                }).await;
+                let log_data = log.clone()?;
+                let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
+                
+                // Check if log was already processed
+                let mut processed_logs_guard = processed_logs.lock().await;
+                if !processed_logs_guard.contains(&log_identifier) {
+                    processed_logs_guard.insert(log_identifier);
+                    drop(processed_logs_guard); // Release the lock
+
+                    let swap_reservation_index = log_data.0.swapReservationIndex;
+                    info!("SwapComplete with reservation index: {:?}", &swap_reservation_index);
+                    active_reservations.with_lock(|reservations_guard| {
+                        reservations_guard.remove(swap_reservation_index);
+                    }).await;
+                }
             }
+
             Some(log) = liquidity_reserved_stream.next() => {
-                info!("LiquidityReserved w/ reservation index: {:?}", &log.clone()?.0.swapReservationIndex);
-                let swap_reservation_index = log.clone()?.0.swapReservationIndex;
-                let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
-                active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.insert(swap_reservation_index, reservation.1);
-                }).await;
+                let log_data = log.clone()?;
+                let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
+                
+                // Check if log was already processed
+                let mut processed_logs_guard = processed_logs.lock().await;
+                if !processed_logs_guard.contains(&log_identifier) {
+                    processed_logs_guard.insert(log_identifier);
+                    drop(processed_logs_guard); // Release the lock
+
+                    info!("LiquidityReserved w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
+                    let swap_reservation_index = log_data.0.swapReservationIndex;
+                    let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
+                    active_reservations.with_lock(|reservations_guard| {
+                        reservations_guard.insert(swap_reservation_index, reservation.1);
+                    }).await;
+                }
             }
+
             Some(log) = proof_proposed_stream.next() => {
-                info!("ProofProposed w/ reservation index: {:?}", &log.clone()?.0.swapReservationIndex);
-                let swap_reservation_index = log.clone()?.0.swapReservationIndex;
-                let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
-                active_reservations.with_lock(|reservations_guard| {
-                    reservations_guard.insert(swap_reservation_index, reservation.1);
-                }).await;
+                let log_data = log.clone()?;
+                let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
+                
+                // Check if log was already processed
+                let mut processed_logs_guard = processed_logs.lock().await;
+                if !processed_logs_guard.contains(&log_identifier) {
+                    processed_logs_guard.insert(log_identifier);
+                    drop(processed_logs_guard); // Release the lock
+
+                    info!("ProofProposed w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
+                    let swap_reservation_index = log_data.0.swapReservationIndex;
+                    let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
+                    active_reservations.with_lock(|reservations_guard| {
+                        reservations_guard.insert(swap_reservation_index, reservation.1);
+                    }).await;
+                }
             }
+
             Some(log) = blocks_added_stream.next() => {
-                let blocks_added = log.clone()?.0;
-                let count = blocks_added.count;
-                let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes::<32>()[32-8..].try_into().unwrap());
-                info!("BlocksAdded w/ confirmation height: {:?} and safe height: {:?}", end_block_height, blocks_added.startBlockHeight);
-                download_safe_bitcoin_headers(ws_rpc_url, &contract_address, Arc::clone(&active_reservations), Some(end_block_height), Some(usize::from_be_bytes(blocks_added.count.to_be_bytes()))).await?;
+                let log_data = log.clone()?;
+                let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
+                
+                // Check if log was already processed
+                let mut processed_logs_guard = processed_logs.lock().await;
+                if !processed_logs_guard.contains(&log_identifier) {
+                    processed_logs_guard.insert(log_identifier);
+                    drop(processed_logs_guard); // Release the lock
+
+                    let blocks_added = log_data.0;
+                    let count = blocks_added.count;
+                    let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes::<32>()[32-8..].try_into().unwrap());
+                    info!("BlocksAdded w/ confirmation height: {:?} and safe height: {:?}", end_block_height, blocks_added.startBlockHeight);
+                    download_safe_bitcoin_headers(ws_rpc_url, &contract_address, Arc::clone(&active_reservations), Some(end_block_height), Some(usize::from_be_bytes(blocks_added.count.to_be_bytes()))).await?;
+                }
             }
         };
     }
