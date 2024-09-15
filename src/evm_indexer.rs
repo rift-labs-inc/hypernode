@@ -376,11 +376,10 @@ pub async fn exchange_event_listener(
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
                 
-                // Check if log was already processed
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
-                    drop(processed_logs_guard); // Release the lock
+                    drop(processed_logs_guard);
 
                     let swap_reservation_index = log_data.0.swapReservationIndex;
                     info!("SwapComplete with reservation index: {:?}", &swap_reservation_index);
@@ -394,11 +393,10 @@ pub async fn exchange_event_listener(
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
                 
-                // Check if log was already processed
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
-                    drop(processed_logs_guard); // Release the lock
+                    drop(processed_logs_guard);
 
                     info!("LiquidityReserved w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
                     let swap_reservation_index = log_data.0.swapReservationIndex;
@@ -413,11 +411,10 @@ pub async fn exchange_event_listener(
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
                 
-                // Check if log was already processed
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
-                    drop(processed_logs_guard); // Release the lock
+                    drop(processed_logs_guard);
 
                     info!("ProofProposed w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
                     let swap_reservation_index = log_data.0.swapReservationIndex;
@@ -432,17 +429,21 @@ pub async fn exchange_event_listener(
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
                 
-                // Check if log was already processed
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
-                    drop(processed_logs_guard); // Release the lock
+                    drop(processed_logs_guard);
 
                     let blocks_added = log_data.0;
                     let count = blocks_added.count;
                     let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes::<32>()[32-8..].try_into().unwrap());
                     info!("BlocksAdded w/ confirmation height: {:?} and safe height: {:?}", end_block_height, blocks_added.startBlockHeight);
-                    download_safe_bitcoin_headers(ws_rpc_url, &contract_address, Arc::clone(&active_reservations), Some(end_block_height), Some(usize::from_be_bytes(blocks_added.count.to_be_bytes()))).await?;
+                    download_safe_bitcoin_headers(
+                        ws_rpc_url,
+                        &contract_address,
+                        Arc::clone(&active_reservations),
+                        Some(end_block_height),
+                        Some(u64::from_be_bytes(blocks_added.count.to_be_bytes::<32>()[32-8..].try_into().unwrap()) as usize)).await?;
                 }
             }
         };

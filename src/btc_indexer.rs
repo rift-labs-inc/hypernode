@@ -25,6 +25,7 @@ async fn analyze_block_for_payments(
     block: &Block,
     active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
+
     let expected_order_inscriptions = active_reservations
         .with_lock(|reservations_guard| {
             reservations_guard
@@ -37,6 +38,7 @@ async fn analyze_block_for_payments(
                 .collect::<Vec<_>>()
         })
         .await;
+
 
     for tx in block.txdata.iter() {
         for script in tx.output.iter().map(|out| out.script_pubkey.clone()) {
@@ -143,9 +145,12 @@ async fn analyze_reservations_for_sufficient_confirmations(
                 }
             };
 
+        println!("Min Confirmation Height: {}", min_confirmation_height);
+        println!("Confirmation Height: {}", confirmation_height);
+
         // TODO: download the block headers from the safe block height to the confirmation height
 
-        let blocks: Vec<Block> = stream::iter(*safe_height..*confirmation_height)
+        let blocks: Vec<Block> = stream::iter(*safe_height..*confirmation_height+1)
             .map(|height| async move {
                 let block_hash = rpc_client.get_block_hash(height).await.map_err(|e| {
                     eyre::eyre!("Failed to get block hash for height {}: {}", height, e)
@@ -168,6 +173,15 @@ async fn analyze_reservations_for_sufficient_confirmations(
 
         let blocks = blocks.into_iter().collect::<Vec<_>>();
 
+
+        let retarget_block_hash = rpc_client.get_block_hash(safe_height - (safe_height % 2016)).await?;
+        let retarget_block = rpc_client.get_block(&retarget_block_hash).await?;
+
+        println!("Retarget block height: {}", retarget_block.bip34_block_height().unwrap());
+        println!("Retarget block hash: {:?}", retarget_block.block_hash().to_string());
+
+        println!("Confirmation Height: {}", confirmation_height);
+
         active_reservations
             .with_lock(|reservations_guard| {
                 reservations_guard.update_btc_reservation_final(
@@ -175,7 +189,7 @@ async fn analyze_reservations_for_sufficient_confirmations(
                     *confirmation_height,
                     *block.block_hash().as_raw_hash().as_byte_array(),
                     blocks,
-                    block.clone(),
+                    retarget_block,
                 );
             })
             .await;
@@ -244,6 +258,14 @@ pub async fn block_listener(
             let block = rpc
                 .get_block(&rpc.get_block_hash(analyzed_height).await?)
                 .await?;
+
+             let current_timestamp = chrono::Utc::now().timestamp() as u64;
+             /*
+             active_reservations.with_lock(|reservations_guard| {
+                 reservations_guard.drop_expired_reservations(current_timestamp)
+             }).await;
+            */
+
 
             analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
             analyze_reservations_for_sufficient_confirmations(

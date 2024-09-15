@@ -12,6 +12,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::constants::MAIN_ELF;
 use crate::core::RiftExchange;
+use crate::proof_broadcast::{self, ProofBroadcastQueue};
 use crate::{
     btc_rpc::BitcoinRpcClient,
     core::{RiftExchange::RiftExchangeInstance, ThreadSafeStore},
@@ -58,7 +59,12 @@ pub struct ProofGenerationQueue {
 }
 
 impl ProofGenerationQueue {
-    pub fn new(store: Arc<ThreadSafeStore>, token_decimals: u8) -> Self {
+    pub fn new(
+        store: Arc<ThreadSafeStore>,
+        token_decimals: u8,
+        proof_broadcast_queue: Arc<ProofBroadcastQueue>,
+        mock_proof_gen: bool,
+    ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
 
         let queue = ProofGenerationQueue { sender };
@@ -67,6 +73,8 @@ impl ProofGenerationQueue {
             receiver,
             store,
             token_decimals,
+            proof_broadcast_queue,
+            mock_proof_gen,
         ));
 
         queue
@@ -82,6 +90,8 @@ impl ProofGenerationQueue {
         mut receiver: mpsc::UnboundedReceiver<ProofGenerationInput>,
         store: Arc<ThreadSafeStore>,
         token_decimals: u8,
+        proof_broadcast_queue: Arc<ProofBroadcastQueue>,
+        mock_proof_gen: bool,
     ) {
         while let Some(item) = receiver.recv().await {
             let reservation_metadata = store
@@ -91,31 +101,15 @@ impl ProofGenerationQueue {
                 .try_into()
                 .unwrap();
             let reserved_vaults = reservation_metadata.reserved_vaults;
-            let amounts_to_reserve = reservation_metadata.reservation.amountsToReserve;
+            let expected_sats_per_lp = reservation_metadata.reservation.expectedSatsOutput;
             let liquidity_reservations = reserved_vaults
                 .iter()
-                .zip(amounts_to_reserve.iter())
-                .map(|(vault, amount)| LiquidityReservation {
-                    amount_reserved: SP1OptimizedU256::from_be_slice(
-                        &buffer_to_18_decimals(*amount, token_decimals).to_be_bytes::<32>(),
-                    ),
-                    btc_exchange_rate: vault.exchangeRate,
+                .zip(expected_sats_per_lp.iter())
+                .map(|(vault, sats)| LiquidityReservation {
+                    expected_sats: *sats,
                     script_pub_key: *vault.btcPayoutLockingScript,
                 })
                 .collect::<Vec<_>>();
-
-            let expected_payout = amounts_to_reserve.iter().zip(reserved_vaults.iter()).fold(
-                U256::ZERO,
-                |acc, (amount_to_reserve, vault)| {
-                    acc.wrapping_add(sats_to_wei(
-                        wei_to_sats(
-                            buffer_to_18_decimals(*amount_to_reserve, token_decimals),
-                            U256::from(vault.exchangeRate),
-                        ),
-                        U256::from(vault.exchangeRate),
-                    ))
-                },
-            );
 
             let btc_final = reservation_metadata.btc_final.unwrap();
             let btc_initial = reservation_metadata.btc_initial.unwrap();
@@ -130,31 +124,48 @@ impl ProofGenerationQueue {
             let circuit_input: rift_core::CircuitInput = rift_lib::proof::build_proof_input(
                 order_nonce,
                 &liquidity_reservations,
-                SP1OptimizedU256::from_be_slice(&expected_payout.to_be_bytes::<32>()),
                 &blocks,
                 proposed_block_index as usize,
                 &rift_lib::to_little_endian(proposed_txid),
                 &retarget_block,
             );
             let result = tokio::task::spawn_blocking(move || {
+                let (public_values_string, execution_report) =
+                    rift_lib::proof::execute(circuit_input, MAIN_ELF);
                 info!(
                     "Reservation {} executed with {} cycles",
                     item.reservation_id,
-                    rift_lib::proof::execute(circuit_input, MAIN_ELF).total_instruction_count()
+                    execution_report.total_instruction_count()
                 );
-                let solidity_proof =
-                    rift_lib::proof::generate_plonk_proof(circuit_input, MAIN_ELF, Some(true));
-                solidity_proof
+                if mock_proof_gen {
+                    (Vec::new(), public_values_string)
+                } else {
+                    let proof =
+                        rift_lib::proof::generate_plonk_proof(circuit_input, MAIN_ELF, Some(true));
+                    let solidity_proof_bytes = proof.bytes();
+                    (solidity_proof_bytes, public_values_string)
+                }
             })
             .await;
 
             match result {
-                Ok(solidity_proof) => {
+                Ok(proof) => {
+                    let solidity_proof_bytes = proof.0;
                     info!(
                         "Proof gen finished for reservation_id: {:?}, proof: {:?}",
-                        item.reservation_id, solidity_proof
+                        item.reservation_id, solidity_proof_bytes
                     );
-                    // TODO: Use the proof & publish it to the chain
+                    info!("Public Inputs Encoded: {:?}", proof.1);
+                    // update the reservation with the proof
+                    store
+                        .with_lock(|store| {
+                            store.update_proof(item.reservation_id, solidity_proof_bytes)
+                        })
+                        .await;
+
+                    proof_broadcast_queue.add(proof_broadcast::ProofBroadcastInput::new(
+                        item.reservation_id,
+                    ));
                 }
                 Err(e) => {
                     error!(

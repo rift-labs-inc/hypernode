@@ -4,6 +4,7 @@ mod constants;
 mod core;
 mod evm_indexer;
 mod proof_builder;
+mod proof_broadcast;
 
 use clap::Parser;
 use constants::RESERVATION_DURATION_HOURS;
@@ -26,14 +27,13 @@ struct Args {
     #[arg(short, long, env)]
     btc_rpc: String,
 
+    /// Ethereum private key for signing transaction proofs
+    #[arg(short, long, env)]
+    private_key: String,
+
     /// Rift Exchange contract address
     #[arg(short, long, env)]
     rift_exchange_address: String,
-
-    /// Build proofs locally, as opposed to using the SP1 prover network [WARNING: 128gb of ram and
-    /// 32 cores required for local prover]
-    #[arg(short, long, env, default_value = "false")]
-    local_prover: bool,
 
     /// RPC concurrency limit
     #[arg(short, long, env, default_value = "10")]
@@ -42,6 +42,10 @@ struct Args {
     /// Bitcoin new block polling interval in seconds
     #[arg(short, long, env, default_value = "30")]
     btc_polling_interval: u64,
+
+    /// Enable mock proof generation 
+    #[arg(short, long, env, default_value= "false")]
+    mock_proof: bool,
 }
 
 #[tokio::main]
@@ -56,9 +60,18 @@ async fn main() -> Result<()> {
     let underyling_token_decimals =
         fetch_token_decimals(&args.evm_ws_rpc, &rift_exchange_address).await?;
 
+    let proof_broadcast_queue = Arc::new(proof_broadcast::ProofBroadcastQueue::new(
+        Arc::clone(&safe_store),
+        args.evm_ws_rpc.clone(),
+        rift_exchange_address,
+        hex::decode(&args.private_key)?[..32].try_into()?,
+    ));
+
     let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(
         Arc::clone(&safe_store),
         underyling_token_decimals,
+        Arc::clone(&proof_broadcast_queue),
+        args.mock_proof
     ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(

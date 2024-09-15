@@ -79,6 +79,7 @@ pub struct ReservationMetadata {
     pub reserved_vaults: Vec<RiftExchange::DepositVault>,
     pub btc_initial: Option<BitcoinReservationInProgress>,
     pub btc_final: Option<BitcoinReservationFinalized>,
+    pub proof: Option<Vec<u8>>
 }
 
 impl ReservationMetadata {
@@ -91,9 +92,11 @@ impl ReservationMetadata {
             reserved_vaults,
             btc_initial: None,
             btc_final: None,
+            proof: None
         }
     }
 }
+
 
 pub struct Store {
     pub reservations: HashMap<U256, ReservationMetadata>,
@@ -122,6 +125,11 @@ impl Store {
         for id in stale_ids {
             self.reservations.remove(&id);
         }
+    }
+
+    pub fn update_proof(&mut self, id: U256, proof: Vec<u8>) {
+        let metadata = self.reservations.get_mut(&id).unwrap();
+        metadata.proof = Some(proof);
     }
 
     pub fn update_btc_reservation_initial(
