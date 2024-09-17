@@ -6,7 +6,6 @@ If a btc transaction is found, validate that it's outputs match with the reserva
 
 
 Then simultaneously poll bitcoin for new blocks, and the rift exchange contract on ethereum for reservation updating events. 
-# TODO: Add events for everything related to reservations changing
 On each evm event():
 => If a reservation is created, download it and add it to the list of active reservations.
 => If a reservation is expired, remove it from the list of active reservations.

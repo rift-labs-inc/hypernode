@@ -61,7 +61,6 @@ pub struct ProofGenerationQueue {
 impl ProofGenerationQueue {
     pub fn new(
         store: Arc<ThreadSafeStore>,
-        token_decimals: u8,
         proof_broadcast_queue: Arc<ProofBroadcastQueue>,
         mock_proof_gen: bool,
     ) -> Self {
@@ -72,7 +71,6 @@ impl ProofGenerationQueue {
         tokio::spawn(ProofGenerationQueue::consume_task(
             receiver,
             store,
-            token_decimals,
             proof_broadcast_queue,
             mock_proof_gen,
         ));
@@ -89,7 +87,6 @@ impl ProofGenerationQueue {
     async fn consume_task(
         mut receiver: mpsc::UnboundedReceiver<ProofGenerationInput>,
         store: Arc<ThreadSafeStore>,
-        token_decimals: u8,
         proof_broadcast_queue: Arc<ProofBroadcastQueue>,
         mock_proof_gen: bool,
     ) {
@@ -120,7 +117,6 @@ impl ProofGenerationQueue {
                 - blocks.first().unwrap().bip34_block_height().unwrap();
             let retarget_block = btc_final.retarget_block;
 
-            // MID_TODO: Some kind of verification that the data between the reservation and the blocks is correct
             let circuit_input: rift_core::CircuitInput = rift_lib::proof::build_proof_input(
                 order_nonce,
                 &liquidity_reservations,
@@ -129,6 +125,7 @@ impl ProofGenerationQueue {
                 &rift_lib::to_little_endian(proposed_txid),
                 &retarget_block,
             );
+            let proof_gen_timer = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(move || {
                 let (public_values_string, execution_report) =
                     rift_lib::proof::execute(circuit_input, MAIN_ELF);
@@ -148,12 +145,14 @@ impl ProofGenerationQueue {
             })
             .await;
 
+
             match result {
                 Ok(proof) => {
                     let solidity_proof_bytes = proof.0;
                     info!(
-                        "Proof gen finished for reservation_id: {:?}, proof: {:?}",
-                        item.reservation_id, solidity_proof_bytes
+                        "Proof generation for reservation_id: {:?} took: {:?}",
+                        item.reservation_id,
+                        proof_gen_timer.elapsed()
                     );
                     info!("Public Inputs Encoded: {:?}", proof.1);
                     // update the reservation with the proof

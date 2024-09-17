@@ -3,12 +3,21 @@ mod btc_rpc;
 mod constants;
 mod core;
 mod evm_indexer;
-mod proof_builder;
 mod proof_broadcast;
+mod proof_builder;
 
+use alloy::{
+    network::{Ethereum, EthereumWallet},
+    providers::{Provider, ProviderBuilder, WsConnect},
+    pubsub::PubSubFrontend,
+    signers::{k256::elliptic_curve::ff::derive::bitvec::boxed, local::PrivateKeySigner},
+};
 use clap::Parser;
 use constants::RESERVATION_DURATION_HOURS;
-use core::{Store, ThreadSafeStore};
+use core::{
+    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeHttp, RiftExchangeWebsocket,
+    Store, ThreadSafeStore,
+};
 use dotenv;
 use evm_indexer::fetch_token_decimals;
 use eyre::Result;
@@ -19,7 +28,7 @@ use tokio::sync::Mutex;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Ethereum RPC Websocket URL for indexing and proposing proofs onchain
+    /// Ethereum RPC websocket URL for indexing and proposing proofs onchain
     #[arg(short, long, env)]
     evm_ws_rpc: String,
 
@@ -27,7 +36,7 @@ struct Args {
     #[arg(short, long, env)]
     btc_rpc: String,
 
-    /// Ethereum private key for signing transaction proofs
+    /// Ethereum private key for signing hypernode initiated transactions
     #[arg(short, long, env)]
     private_key: String,
 
@@ -43,9 +52,19 @@ struct Args {
     #[arg(short, long, env, default_value = "30")]
     btc_polling_interval: u64,
 
-    /// Enable mock proof generation 
-    #[arg(short, long, env, default_value= "false")]
+    /// Enable mock proof generation
+    #[arg(short, long, env, default_value = "false")]
     mock_proof: bool,
+
+    /// Utilize Flashbots to prevent frontrunning on propose + release transactions (recommended
+    /// for mainnet)
+    #[arg(short, long, env, default_value = "false")]
+    flashbots: bool,
+
+    /// Flashbots relay URL, required if flashbots is enabled, will only be utilized when
+    /// broadcasting transactions
+    #[arg(short, long, env)]
+    flashbots_relay_rpc: Option<String>,
 }
 
 #[tokio::main]
@@ -57,31 +76,69 @@ async fn main() -> Result<()> {
 
     let safe_store = Arc::new(ThreadSafeStore::new());
 
-    let underyling_token_decimals =
-        fetch_token_decimals(&args.evm_ws_rpc, &rift_exchange_address).await?;
+    // If flashbots is enabled, the flashbots relay URL is required
+    let flashbots_url = if args.flashbots {
+        Some(
+            args.flashbots_relay_rpc
+                .as_ref()
+                .ok_or_else(|| {
+                    eyre::eyre!("Flashbots relay URL is required when flashbots is enabled")
+                })?
+                .clone(),
+        )
+    } else {
+        Option::None
+    };
+
+    let private_key: [u8; 32] =
+        hex::decode(args.private_key.trim_start_matches("0x"))?[..32].try_into()?;
+
+    let provider: Arc<EvmWebsocketProvider> = Arc::new(
+        ProviderBuilder::new()
+            .with_recommended_fillers()
+            .wallet(EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&private_key.into()).unwrap(),
+            ))
+            .on_ws(WsConnect::new(&args.evm_ws_rpc))
+            .await
+            .expect("Failed to connect to WebSocket"),
+    );
+
+    let contract: Arc<RiftExchangeWebsocket> =
+        Arc::new(RiftExchange::new(rift_exchange_address, provider.clone()));
+
+    let flashbots_provider: Arc<Option<EvmHttpProvider>> = Arc::new(match flashbots_url {
+        None => None,
+        Some(url) => Some(
+            ProviderBuilder::new()
+                .with_recommended_fillers()
+                .wallet(EthereumWallet::from(
+                    PrivateKeySigner::from_bytes(&private_key.into()).unwrap(),
+                ))
+                .on_http(url.parse()?),
+        ),
+    });
 
     let proof_broadcast_queue = Arc::new(proof_broadcast::ProofBroadcastQueue::new(
         Arc::clone(&safe_store),
-        args.evm_ws_rpc.clone(),
-        rift_exchange_address,
-        hex::decode(&args.private_key)?[..32].try_into()?,
+        Arc::clone(&flashbots_provider),
+        Arc::clone(&contract),
     ));
 
     let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(
         Arc::clone(&safe_store),
-        underyling_token_decimals,
         Arc::clone(&proof_broadcast_queue),
-        args.mock_proof
+        args.mock_proof,
     ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
-        evm_indexer::find_block_height_from_time(&args.evm_ws_rpc, RESERVATION_DURATION_HOURS),
+        evm_indexer::find_block_height_from_time(&contract, RESERVATION_DURATION_HOURS),
         btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS)
     )?;
 
     let synced_reservation_evm_height = evm_indexer::sync_reservations(
-        &args.evm_ws_rpc,
-        &rift_exchange_address,
+        Arc::clone(&contract),
+        Arc::clone(&flashbots_provider),
         Arc::clone(&safe_store),
         start_evm_block_height,
         args.rpc_concurrency,
@@ -89,8 +146,7 @@ async fn main() -> Result<()> {
     .await?;
 
     let synced_block_header_evm_height = evm_indexer::download_safe_bitcoin_headers(
-        &args.evm_ws_rpc,
-        &rift_exchange_address,
+        Arc::clone(&contract),
         Arc::clone(&safe_store),
         None,
         None,
@@ -99,8 +155,8 @@ async fn main() -> Result<()> {
 
     tokio::try_join!(
         evm_indexer::exchange_event_listener(
-            &args.evm_ws_rpc,
-            rift_exchange_address,
+            Arc::clone(&contract),
+            Arc::clone(&flashbots_provider),
             synced_reservation_evm_height,
             synced_block_header_evm_height,
             Arc::clone(&safe_store)

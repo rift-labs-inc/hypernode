@@ -1,69 +1,136 @@
+use alloy::network::eip2718::Encodable2718;
+use alloy::providers::WalletProvider;
+use alloy::transports::{BoxTransport, BoxTransportConnect, Transport};
 use alloy::{
     contract,
     eips::{BlockId, BlockNumberOrTag},
     network::Ethereum,
+    network::TransactionBuilder,
     primitives::{Address, Bytes, U256},
     providers::{FilterPollerBuilder, Provider, ProviderBuilder, RootProvider, WsConnect},
     pubsub::PubSubFrontend,
-    rpc::types::{BlockTransactionsKind, Filter},
+    rpc::types::{BlockTransactionsKind, Filter, TransactionInput, TransactionRequest},
     sol_types::{SolEvent, SolValue},
 };
 use eyre::{Result, WrapErr};
 use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
 use log::info;
+use core::time;
 use std::error::Error;
 use std::time::{Instant, UNIX_EPOCH};
 use std::{any::Any, collections::HashMap};
 use std::{collections::HashSet, sync::Arc};
-use tokio::sync::Mutex;
 use tokio::time::Duration;
+use tokio::{sync::Mutex, time::sleep};
 
+use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
+use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
 use crate::{
-    constants::HEADER_LOOKBACK_LIMIT,
+    constants::{CHALLENGE_PERIOD_MINUTES, HEADER_LOOKBACK_LIMIT},
     core::{
         BlockHashes, BlockHeaderAggregator, DepositVaultAggregator, ReservationMetadata,
         RiftExchange::{self, RiftExchangeInstance, SwapReservation},
         ThreadSafeStore,
     },
 };
-use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
 
+// non blocking
+pub fn release_after_challenge_period(
+    swap_reservation_index: U256,
+    unlock_timestamp: u32,
+    contract: Arc<RiftExchangeWebsocket>,
+    flashbots_provider: Arc<Option<EvmHttpProvider>>,
+) {
+    tokio::spawn(async move {
+        let buffer_seconds = 30 as u32; // buffer to ensure the ethereum block timestamp is
+                                        // past the unlock timestamp
+        let release_liquidity_timestamp = unlock_timestamp + buffer_seconds;
+        let current_timestamp = UNIX_EPOCH.elapsed().unwrap().as_secs() as u32;
+        let sleep_duration = if current_timestamp > release_liquidity_timestamp {
+            0
+        } else {
+            release_liquidity_timestamp - current_timestamp
+        };
 
-pub async fn fetch_token_decimals(
-    ws_rpc_url: &str,
-    rift_exchange_address: &Address,
-) -> Result<u8> {
-    let provider = ProviderBuilder::new()
-        .on_ws(WsConnect::new(ws_rpc_url))
-        .await?;
+        info!(
+            "Releasing liquidity for reservation index: {} after challenge period, waiting for {:#?}",
+            swap_reservation_index,
+            time::Duration::from_secs(sleep_duration.into())
+        );
+        // get current utc timestamp
+        sleep(Duration::from_secs(sleep_duration.into())).await;
+        let txn_calldata = contract
+            .releaseLiquidity(swap_reservation_index)
+            .calldata()
+            .to_owned();
+        let tx_hash = match flashbots_provider.as_ref() {
+            Some(flashbots_provider) => {
+                info!("Releasing liquidity using Flashbots");
+                let tx = TransactionRequest::default()
+                    .to(*contract.address())
+                    .input(TransactionInput::new(txn_calldata));
+                let tx = contract.provider().fill(tx).await.unwrap();
+                let tx_envelope = tx
+                    .as_builder()
+                    .unwrap()
+                    .clone()
+                    .build(&contract.provider().wallet())
+                    .await
+                    .unwrap();
+                let tx_encoded = tx_envelope.encoded_2718();
+                let pending = flashbots_provider
+                    .send_raw_transaction(&tx_encoded)
+                    .await
+                    .unwrap()
+                    .register()
+                    .await
+                    .unwrap();
+                pending.tx_hash().clone()
+            }
+            None => {
+                let tx = TransactionRequest::default()
+                    .to(*contract.address())
+                    .input(TransactionInput::new(txn_calldata));
+                contract
+                    .provider()
+                    .send_transaction(tx)
+                    .await
+                    .unwrap()
+                    .tx_hash()
+                    .clone()
+            }
+        };
+        info!("Liquidity released with evm tx hash: {}", tx_hash);
+    });
+}
 
-    let rift_exchange = RiftExchange::new(*rift_exchange_address, &provider);
-    Ok(rift_exchange.TOKEN_DECIMALS().call().await?._0)
+pub async fn fetch_token_decimals(exchange: &RiftExchangeWebsocket) -> Result<u8> {
+    Ok(exchange.TOKEN_DECIMALS().call().await?._0)
 }
 
 fn decode_vaults(encoded_vaults: Vec<u8>) -> Result<Vec<RiftExchange::DepositVault>> {
-    let encoded_vaults = Vec::<Bytes>::abi_decode(&encoded_vaults, false).map_err(|_| eyre::eyre!("Failed to decode vault byte array"))?;
-    encoded_vaults.into_iter().map(|bytes| {
-        let vault = RiftExchange::DepositVault::abi_decode(&bytes.to_vec(), false)
-            .map_err(|e| eyre::eyre!("Failed to decode deposit vault: {}", e))?;
-        Ok(vault)
-    }).collect()
+    let encoded_vaults = Vec::<Bytes>::abi_decode(&encoded_vaults, false)
+        .map_err(|_| eyre::eyre!("Failed to decode vault byte array"))?;
+    encoded_vaults
+        .into_iter()
+        .map(|bytes| {
+            let vault = RiftExchange::DepositVault::abi_decode(&bytes.to_vec(), false)
+                .map_err(|e| eyre::eyre!("Failed to decode deposit vault: {}", e))?;
+            Ok(vault)
+        })
+        .collect()
 }
 
 pub async fn download_vaults(
-    ws_rpc_url: &str,
-    rift_exchange_address: &Address,
+    contract: Arc<RiftExchangeWebsocket>,
     vault_indices: Vec<u32>,
 ) -> Result<Vec<RiftExchange::DepositVault>> {
-    let provider = ProviderBuilder::new()
-        .on_ws(WsConnect::new(ws_rpc_url))
-        .await?;
-
+    let provider = contract.provider();
     let encoded_vaults = DepositVaultAggregator::deploy_builder(
         provider,
         vault_indices.clone(),
-        *rift_exchange_address,
+        *contract.address(),
     )
     .call()
     .await?;
@@ -85,24 +152,26 @@ fn decode_block_hashes(encoded_blocks: Vec<u8>) -> Result<Vec<[u8; 32]>> {
 
 // get available bitcoin headers stored on the rift exchange contract
 pub async fn download_safe_bitcoin_headers(
-    ws_rpc_url: &str,
-    rift_exchange_address: &Address,
+    contract: Arc<RiftExchangeWebsocket>,
     store: Arc<ThreadSafeStore>,
     end_block_height: Option<u64>,
     lookback_count: Option<usize>,
 ) -> Result<u64> {
-    let provider = ProviderBuilder::new()
-        .on_ws(WsConnect::new(ws_rpc_url))
-        .await?;
-
-    let contract = RiftExchange::new(*rift_exchange_address, &provider);
+    let provider = contract.provider();
     let current_evm_tip = provider.get_block_number().await?;
 
     let stored_tip = match end_block_height {
         Some(height) => height,
-        None => u64::from_be_bytes(contract.currentHeight().call().await?._0.to_be_bytes::<32>()[32-8..].try_into().unwrap()),
+        None => u64::from_be_bytes(
+            contract
+                .currentHeight()
+                .call()
+                .await?
+                ._0
+                .to_be_bytes::<32>()[32 - 8..]
+                .try_into()?,
+        ),
     };
-
 
     let lookback_limit = lookback_count.unwrap_or(HEADER_LOOKBACK_LIMIT);
 
@@ -114,7 +183,7 @@ pub async fn download_safe_bitcoin_headers(
     heights.dedup();
 
     let encoded_blocks =
-        BlockHeaderAggregator::deploy_builder(provider, heights.clone(), *rift_exchange_address)
+        BlockHeaderAggregator::deploy_builder(provider, heights.clone(), *contract.address())
             .call()
             .await?;
 
@@ -127,9 +196,12 @@ pub async fn download_safe_bitcoin_headers(
                 if hash == &[0u8; 32] {
                     continue;
                 }
-                store_guard
-                    .safe_contract_block_hashes
-                    .insert(u64::from_be_bytes(heights[i].to_be_bytes::<32>()[32-8..].try_into().unwrap()), *hash);
+                store_guard.safe_contract_block_hashes.insert(
+                    u64::from_be_bytes(
+                        heights[i].to_be_bytes::<32>()[32 - 8..].try_into().unwrap(),
+                    ),
+                    *hash,
+                );
             }
         })
         .await;
@@ -140,15 +212,8 @@ pub async fn download_safe_bitcoin_headers(
 // Downloads the actual reservation struct and all utilized deposit vaults
 pub async fn download_reservation(
     reservation_id: U256,
-    ws_rpc_url: &str,
-    contract_address: &Address,
+    contract: Arc<RiftExchangeWebsocket>,
 ) -> Result<(U256, ReservationMetadata)> {
-    let provider = ProviderBuilder::new()
-        .on_ws(WsConnect::new(ws_rpc_url))
-        .await?;
-
-    let contract = RiftExchange::new(*contract_address, &provider);
-
     let reservation = match contract.getReservation(reservation_id).call().await {
         Ok(res) => res._0,
         Err(e) => {
@@ -164,32 +229,25 @@ pub async fn download_reservation(
     let vault_indexes: Vec<u32> = reservation
         .vaultIndexes
         .iter()
-        .map(|index| {
-            u32::from_be_bytes(index.to_be_bytes::<32>()[32-4..].try_into().unwrap())
-        })
+        .map(|index| u32::from_be_bytes(index.to_be_bytes::<32>()[32 - 4..].try_into().unwrap()))
         .collect();
 
-    match download_vaults(ws_rpc_url, contract_address, vault_indexes).await {
-        Ok(vaults) => {
-            // TODO: download liquidity providers and store them, also abstract out this logic to a
-            // function that can be used here and in the listener
-            Ok((
-                reservation_id,
-                ReservationMetadata::new(reservation, vaults),
-            ))
-        }
+    match download_vaults(contract, vault_indexes).await {
+        Ok(vaults) => Ok((
+            reservation_id,
+            ReservationMetadata::new(reservation, vaults),
+        )),
         Err(e) => Err(e.into()),
     }
 }
 
-pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result<u64> {
+pub async fn find_block_height_from_time(
+    rift_exchange: &RiftExchangeWebsocket,
+    hours: u64,
+) -> Result<u64> {
     let time = Instant::now();
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .on_ws(WsConnect::new(ws_rpc_url))
-            .await?,
-    );
 
+    let provider = rift_exchange.provider();
     let current_block = provider
         .get_block(BlockId::latest(), BlockTransactionsKind::Hashes)
         .await?
@@ -234,32 +292,27 @@ pub async fn find_block_height_from_time(ws_rpc_url: &str, hours: u64) -> Result
 
 // Goes through the last RESERVATION_DURATION_HOURS worth of ethereum blocks and collects all reservations
 pub async fn sync_reservations(
-    ws_rpc_url: &str,
-    contract_address: &Address,
-    active_reservations: Arc<ThreadSafeStore>,
+    contract: Arc<RiftExchangeWebsocket>,
+    flashbots_provider: Arc<Option<EvmHttpProvider>>,
+    safe_store: Arc<ThreadSafeStore>,
     start_block: u64,
     rpc_concurrency: usize,
 ) -> Result<u64> {
     let time = Instant::now();
     info!("Syncing reservations from block {}", start_block);
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .on_ws(WsConnect::new(ws_rpc_url))
-            .await?,
-    );
-    let contract = Arc::new(RiftExchange::new(*contract_address, provider.clone()));
+    let provider = contract.provider();
     let latest_block: u64 = provider.get_block_number().await?;
     // Create a filter to get logs from the last 8 hours for the specified contract
     let log_filter = Filter::new()
-        .address(*contract_address)
+        .address(*contract.address())
         .from_block(start_block)
         .to_block(latest_block);
 
-    // Fetch the logs
     let logs = provider.get_logs(&log_filter).await?;
 
     // Process logs to determine active reservation IDs
     let mut active_reservations_set: HashSet<U256> = HashSet::new();
+    let mut reservations_in_challenge: HashSet<U256> = HashSet::new();
 
     for log in logs {
         match log.topic0() {
@@ -268,39 +321,63 @@ pub async fn sync_reservations(
                     log.log_decode()?.inner.data;
                 active_reservations_set.insert(reservation_event.swapReservationIndex);
             }
+            Some(&RiftExchange::ProofProposed::SIGNATURE_HASH) => {
+                let proof_proposed_event: RiftExchange::ProofProposed =
+                    log.log_decode()?.inner.data;
+                // TODO: This is not mainnet safe, we need to validate that a proposed proof is not
+                // malicious / part of an orphan chain, instead of just removing the reservation
+                active_reservations_set.remove(&proof_proposed_event.swapReservationIndex);
+                reservations_in_challenge.insert(proof_proposed_event.swapReservationIndex);
+            }
             Some(&RiftExchange::SwapComplete::SIGNATURE_HASH) => {
                 let swap_complete_event: RiftExchange::SwapComplete = log.log_decode()?.inner.data;
                 active_reservations_set.remove(&swap_complete_event.swapReservationIndex);
+                reservations_in_challenge.remove(&swap_complete_event.swapReservationIndex);
             }
             _ => {}
         }
     }
 
-    // the rest of these are fully active or currently in a challenge period
+    // combine the active reservations and reservations in challenge into one set
+    let reservations_to_download: HashSet<U256> = active_reservations_set
+        .union(&reservations_in_challenge)
+        .cloned()
+        .collect();
+
+    // these are fully active reservations that are not in the challenge period
     let active_reservations_ids: Vec<U256> = active_reservations_set.into_iter().collect();
 
-    // download all reservation data from the contract
-    let reservations: HashMap<U256, ReservationMetadata> = stream::iter(active_reservations_ids)
-        .map(|reservation_id| {
-            let contract = Arc::clone(&contract);
-            async move {
-                download_reservation(reservation_id, ws_rpc_url, contract.address())
-                    .await
-                    .map_err(|e| {
-                        info!("Failed to download reservation: {}", e);
-                        e
-                    })
-            }
-        })
-        .buffer_unordered(rpc_concurrency)
-        .try_collect()
-        .await
-        .map_err(|e: eyre::Report| e)?;
+    let reservations_to_download: Vec<U256> = reservations_to_download.into_iter().collect();
+
+    // download all reservation data from the contract, both active and in challenge
+    let downloaded_reservations: HashMap<U256, ReservationMetadata> =
+        stream::iter(reservations_to_download)
+            .map(|reservation_id| {
+                let contract: Arc<RiftExchangeWebsocket> = Arc::clone(&contract);
+                async move {
+                    download_reservation(reservation_id, contract)
+                        .await
+                        .map_err(|e| {
+                            info!("Failed to download reservation: {}", e);
+                            e
+                        })
+                }
+            })
+            .buffer_unordered(rpc_concurrency)
+            .try_collect()
+            .await
+            .map_err(|e: eyre::Report| e)?;
+
+    let reservations = downloaded_reservations
+        .clone()
+        .into_iter()
+        .filter(|(id, _)| active_reservations_ids.contains(id))
+        .collect::<HashMap<U256, ReservationMetadata>>();
 
     let total_reservations = &reservations.len();
 
     // Update active_reservations
-    active_reservations
+    safe_store
         .with_lock(|reservations_guard| {
             for (id, metadata) in reservations {
                 reservations_guard.insert(id, metadata);
@@ -316,26 +393,32 @@ pub async fn sync_reservations(
         time.elapsed()
     );
 
+    // Now spawn a task to call releaseLiquidity on all reservations in a challenge period after
+    // their challenge period ends
+    downloaded_reservations
+        .into_iter()
+        .filter(|(id, _)| reservations_in_challenge.contains(id))
+        .for_each(|(id, metadata)| {
+            let unlock_timestamp = metadata.reservation.unlockTimestamp;
+            let contract = Arc::clone(&contract);
+            let flashbots_provider = Arc::clone(&flashbots_provider);
+            release_after_challenge_period(id, unlock_timestamp, contract, flashbots_provider);
+        });
+
     Ok(latest_block)
 }
 
 pub async fn exchange_event_listener(
-    ws_rpc_url: &str,
-    contract_address: Address,
+    contract: Arc<RiftExchangeWebsocket>,
+    flashbots_provider: Arc<Option<EvmHttpProvider>>,
     start_index_block_height: u64,
     start_block_header_height: u64,
     active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
-    let provider = ProviderBuilder::new()
-        .on_ws(WsConnect::new(ws_rpc_url))
-        .await?;
-
-    let contract = RiftExchange::new(contract_address, &provider);
-
     info!(
         "Rift deployed at: {} on chain ID: {}",
         contract.address(),
-        &provider.get_chain_id().await?
+        &contract.provider().get_chain_id().await?
     );
 
     // Create filters for each event.
@@ -371,11 +454,13 @@ pub async fn exchange_event_listener(
     let processed_logs = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
+        let contract = Arc::clone(&contract);
+        let flashbots_provider = Arc::clone(&flashbots_provider);
         tokio::select! {
             Some(log) = swap_complete_stream.next() => {
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
-                
+
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
@@ -392,7 +477,7 @@ pub async fn exchange_event_listener(
             Some(log) = liquidity_reserved_stream.next() => {
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
-                
+
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
@@ -400,7 +485,7 @@ pub async fn exchange_event_listener(
 
                     info!("LiquidityReserved w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
                     let swap_reservation_index = log_data.0.swapReservationIndex;
-                    let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
+                    let reservation = download_reservation(swap_reservation_index, Arc::clone(&contract)).await?;
                     active_reservations.with_lock(|reservations_guard| {
                         reservations_guard.insert(swap_reservation_index, reservation.1);
                     }).await;
@@ -410,7 +495,7 @@ pub async fn exchange_event_listener(
             Some(log) = proof_proposed_stream.next() => {
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
-                
+
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
@@ -418,17 +503,24 @@ pub async fn exchange_event_listener(
 
                     info!("ProofProposed w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
                     let swap_reservation_index = log_data.0.swapReservationIndex;
-                    let reservation = download_reservation(swap_reservation_index, ws_rpc_url, &contract_address).await?; 
+                    let reservation_metadata = download_reservation(swap_reservation_index, Arc::clone(&contract)).await?;
                     active_reservations.with_lock(|reservations_guard| {
-                        reservations_guard.insert(swap_reservation_index, reservation.1);
+                        reservations_guard.insert(swap_reservation_index, reservation_metadata.1.clone());
                     }).await;
+
+                    release_after_challenge_period(
+                        swap_reservation_index,
+                        reservation_metadata.1.reservation.unlockTimestamp,
+                        Arc::clone(&contract),
+                        Arc::clone(&flashbots_provider)
+                    );
                 }
             }
 
             Some(log) = blocks_added_stream.next() => {
                 let log_data = log.clone()?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
-                
+
                 let mut processed_logs_guard = processed_logs.lock().await;
                 if !processed_logs_guard.contains(&log_identifier) {
                     processed_logs_guard.insert(log_identifier);
@@ -439,8 +531,7 @@ pub async fn exchange_event_listener(
                     let end_block_height = u64::from_be_bytes((blocks_added.startBlockHeight + count).to_be_bytes::<32>()[32-8..].try_into().unwrap());
                     info!("BlocksAdded w/ confirmation height: {:?} and safe height: {:?}", end_block_height, blocks_added.startBlockHeight);
                     download_safe_bitcoin_headers(
-                        ws_rpc_url,
-                        &contract_address,
+                        Arc::clone(&contract),
                         Arc::clone(&active_reservations),
                         Some(end_block_height),
                         Some(u64::from_be_bytes(blocks_added.count.to_be_bytes::<32>()[32-8..].try_into().unwrap()) as usize)).await?;

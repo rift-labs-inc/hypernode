@@ -1,19 +1,23 @@
-use crate::constants::MAIN_ELF;
-use crate::core::RiftExchange;
+use crate::constants::{CHALLENGE_PERIOD_MINUTES, MAIN_ELF};
+use crate::core::{EvmHttpProvider, RiftExchange, RiftExchangeWebsocket};
 use crate::{
     btc_rpc::BitcoinRpcClient,
     core::{RiftExchange::RiftExchangeInstance, ThreadSafeStore},
 };
-use alloy::network::{EthereumWallet, NetworkWallet};
+use alloy::network::eip2718::Encodable2718;
+use alloy::network::{Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder};
 use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider, WsConnect};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
+
+use alloy::transports::http::Http;
+use alloy::transports::BoxTransport;
 use bitcoin::hex::DisplayHex;
 use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block, Script};
 use crypto_bigint::{AddMod, U256 as SP1OptimizedU256};
 use eyre::Result;
-use log::{error, info};
+use log::{debug, error, info};
 use rift_core::lp::LiquidityReservation;
 use rift_lib;
 use std::sync::Arc;
@@ -38,18 +42,16 @@ pub struct ProofBroadcastQueue {
 impl ProofBroadcastQueue {
     pub fn new(
         store: Arc<ThreadSafeStore>,
-        ws_rpc_url: String,
-        rift_exchange_address: Address,
-        private_key: [u8; 32],
+        flashbots_provider: Arc<Option<EvmHttpProvider>>,
+        contract: Arc<RiftExchangeWebsocket>,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let queue = ProofBroadcastQueue { sender };
         tokio::spawn(ProofBroadcastQueue::consume_task(
             receiver,
             store,
-            ws_rpc_url,
-            rift_exchange_address,
-            private_key,
+            flashbots_provider,
+            contract,
         ));
         queue
     }
@@ -63,22 +65,22 @@ impl ProofBroadcastQueue {
     async fn consume_task(
         mut receiver: mpsc::UnboundedReceiver<ProofBroadcastInput>,
         store: Arc<ThreadSafeStore>,
-        ws_rpc_url: String,
-        rift_exchange_address: Address,
-        private_key: [u8; 32],
+        flashbots_provider: Arc<Option<EvmHttpProvider>>,
+        contract: Arc<RiftExchangeWebsocket>,
     ) {
-        let wallet =
-            EthereumWallet::from(PrivateKeySigner::from_bytes(&private_key.into()).unwrap());
-        let provider = ProviderBuilder::new()
-            .with_recommended_fillers()
-            .wallet(wallet)
-            .on_ws(WsConnect::new(&ws_rpc_url))
-            .await
-            .expect("Failed to connect to WebSocket");
+        let provider = contract.provider();
 
-        let contract = RiftExchange::new(rift_exchange_address, provider.clone());
+        info!(
+            "Hypernode address: {}",
+            provider.wallet().default_signer().address()
+        );
 
         while let Some(item) = receiver.recv().await {
+            let contract = contract.clone();
+            let provider = provider.clone();
+
+            let flashbots_provider = flashbots_provider.clone();
+
             let reservation_metadata = store
                 .with_lock(|store| store.get(item.reservation_id).unwrap().clone())
                 .await;
@@ -124,16 +126,49 @@ impl ProofBroadcastQueue {
                 .calldata()
                 .to_owned();
 
-            println!("txn_calldata: {}", txn_calldata.as_hex());
+            debug!(
+                "proposeTransactionProof calldata for reservation {} : {}",
+                item.reservation_id,
+                txn_calldata.as_hex()
+            );
 
-            println!("Hypernode address: {}", provider.wallet().default_signer().address());
+            let tx_hash = if flashbots_provider.is_some() {
+                info!("Proposing proof using Flashbots");
 
-            let tx = TransactionRequest::default()
-                .to(*contract.address())
-                .input(txn_calldata.into());
+                let tx = TransactionRequest::default()
+                    .to(*contract.address())
+                    .input(TransactionInput::new(txn_calldata));
+                let tx = provider.fill(tx).await.unwrap();
+                let tx_envelope = tx
+                    .as_builder()
+                    .unwrap()
+                    .clone()
+                    .build(&provider.wallet())
+                    .await
+                    .unwrap();
+                let tx_encoded = tx_envelope.encoded_2718();
+                let pending = provider
+                    .send_raw_transaction(&tx_encoded)
+                    .await
+                    .unwrap()
+                    .register()
+                    .await
+                    .unwrap();
+                pending.tx_hash().to_owned()
+            } else {
+                let tx = TransactionRequest::default()
+                    .to(*contract.address())
+                    .input(TransactionInput::new(txn_calldata));
 
-            let tx_hash = provider.send_transaction(tx).await.unwrap();
-            info!("Proof broadcasted with evm tx hash: {}", tx_hash.tx_hash());
+                provider
+                    .send_transaction(tx)
+                    .await
+                    .unwrap()
+                    .tx_hash()
+                    .to_owned()
+            };
+
+            info!("Proof broadcasted with evm tx hash: {}", tx_hash);
         }
     }
 }

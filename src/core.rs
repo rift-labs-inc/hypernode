@@ -1,6 +1,14 @@
+use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::U256;
+use alloy::providers::fillers::{
+    ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+};
+use alloy::providers::{Provider, RootProvider};
+use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
+use alloy::transports::http::Http;
 use bitcoin::Block;
+use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -46,6 +54,35 @@ sol!(
     "artifacts/IERC20.json"
 );
 
+pub type EvmWebsocketProvider = FillProvider<
+    JoinFill<
+        JoinFill<
+            JoinFill<JoinFill<alloy::providers::Identity, GasFiller>, NonceFiller>,
+            ChainIdFiller,
+        >,
+        WalletFiller<EthereumWallet>,
+    >,
+    RootProvider<PubSubFrontend>,
+    PubSubFrontend,
+    Ethereum,
+>;
+pub type EvmHttpProvider = FillProvider<
+    JoinFill<
+        JoinFill<
+            JoinFill<JoinFill<alloy::providers::Identity, GasFiller>, NonceFiller>,
+            ChainIdFiller,
+        >,
+        WalletFiller<EthereumWallet>,
+    >,
+    RootProvider<Http<Client>>,
+    Http<Client>,
+    Ethereum,
+>;
+
+pub type RiftExchangeWebsocket =
+    RiftExchange::RiftExchangeInstance<PubSubFrontend, Arc<EvmWebsocketProvider>>;
+pub type RiftExchangeHttp = RiftExchange::RiftExchangeInstance<Http<Client>, Arc<EvmHttpProvider>>;
+
 #[derive(Clone)]
 pub struct BitcoinReservationFinalized {
     pub confirmation_height: u64,
@@ -79,7 +116,7 @@ pub struct ReservationMetadata {
     pub reserved_vaults: Vec<RiftExchange::DepositVault>,
     pub btc_initial: Option<BitcoinReservationInProgress>,
     pub btc_final: Option<BitcoinReservationFinalized>,
-    pub proof: Option<Vec<u8>>
+    pub proof: Option<Vec<u8>>,
 }
 
 impl ReservationMetadata {
@@ -92,11 +129,10 @@ impl ReservationMetadata {
             reserved_vaults,
             btc_initial: None,
             btc_final: None,
-            proof: None
+            proof: None,
         }
     }
 }
-
 
 pub struct Store {
     pub reservations: HashMap<U256, ReservationMetadata>,

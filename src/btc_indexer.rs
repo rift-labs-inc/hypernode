@@ -1,12 +1,16 @@
 use futures::StreamExt;
 use futures_util::stream;
+use core::time;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bitcoin::consensus::serialize;
-use bitcoin::{hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, psbt::serialize, script::Builder, Block, Transaction};
+use bitcoin::{
+    hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, psbt::serialize, script::Builder,
+    Block, Transaction,
+};
 use eyre::Result;
-use log::info;
+use log::{debug, info};
 
 use crate::{
     btc_rpc::BitcoinRpcClient, constants::CONFIRMATION_HEIGHT_DELTA, core::ThreadSafeStore,
@@ -25,7 +29,6 @@ async fn analyze_block_for_payments(
     block: &Block,
     active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
-
     let expected_order_inscriptions = active_reservations
         .with_lock(|reservations_guard| {
             reservations_guard
@@ -38,7 +41,6 @@ async fn analyze_block_for_payments(
                 .collect::<Vec<_>>()
         })
         .await;
-
 
     for tx in block.txdata.iter() {
         for script in tx.output.iter().map(|out| out.script_pubkey.clone()) {
@@ -127,7 +129,7 @@ async fn analyze_reservations_for_sufficient_confirmations(
 
         let min_confirmation_height =
             btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA;
-        
+
         // it's possible that the actual btc chain has enough confirmations but the contract chain
         // does not, in that case, we provide the actual + CONFIRMATION_HEIGHT_DELTA block as the
         // confirmation height b/c the contract chain doesn't have enough blocks yet
@@ -145,12 +147,10 @@ async fn analyze_reservations_for_sufficient_confirmations(
                 }
             };
 
-        println!("Min Confirmation Height: {}", min_confirmation_height);
-        println!("Confirmation Height: {}", confirmation_height);
+        debug!("Min Confirmation Height: {}, reservation: {}", min_confirmation_height, id);
+        debug!("Confirmation Height: {}, reservation: {}", confirmation_height, id);
 
-        // TODO: download the block headers from the safe block height to the confirmation height
-
-        let blocks: Vec<Block> = stream::iter(*safe_height..*confirmation_height+1)
+        let blocks: Vec<Block> = stream::iter(*safe_height..*confirmation_height + 1)
             .map(|height| async move {
                 let block_hash = rpc_client.get_block_hash(height).await.map_err(|e| {
                     eyre::eyre!("Failed to get block hash for height {}: {}", height, e)
@@ -173,14 +173,23 @@ async fn analyze_reservations_for_sufficient_confirmations(
 
         let blocks = blocks.into_iter().collect::<Vec<_>>();
 
-
-        let retarget_block_hash = rpc_client.get_block_hash(safe_height - (safe_height % 2016)).await?;
+        let retarget_block_hash = rpc_client
+            .get_block_hash(safe_height - (safe_height % 2016))
+            .await?;
         let retarget_block = rpc_client.get_block(&retarget_block_hash).await?;
 
-        println!("Retarget block height: {}", retarget_block.bip34_block_height().unwrap());
-        println!("Retarget block hash: {:?}", retarget_block.block_hash().to_string());
+        debug!(
+            "Retarget block height: {}, reservation: {}",
+            retarget_block.bip34_block_height().unwrap(),
+            id
+        );
+        debug!(
+            "Retarget block hash: {:?}, reservation: {}",
+            retarget_block.block_hash().to_string(),
+            id
+        );
 
-        println!("Confirmation Height: {}", confirmation_height);
+        debug!("Confirmation Height: {}, reservation: {}", confirmation_height, id);
 
         active_reservations
             .with_lock(|reservations_guard| {
@@ -193,7 +202,6 @@ async fn analyze_reservations_for_sufficient_confirmations(
                 );
             })
             .await;
-        
 
         // add it the proof gen queue
         info!("Adding reservation: {} to proof generation queue", id);
@@ -223,7 +231,7 @@ pub async fn find_block_height_from_time(rpc_url: &str, hours: u64) -> Result<u6
 
         if block_timestamp <= target_timestamp {
             info!(
-                "Found Bitcoin block height: {}, {} hours from tip in {:?}",
+                "Found Bitcoin block height: {}, {:.2} from tip in {:?}",
                 check_block,
                 (current_block_timestamp - block_timestamp) as f64 / 3600 as f64,
                 time.elapsed()
@@ -259,13 +267,12 @@ pub async fn block_listener(
                 .get_block(&rpc.get_block_hash(analyzed_height).await?)
                 .await?;
 
-             let current_timestamp = chrono::Utc::now().timestamp() as u64;
-             /*
+            let current_timestamp = chrono::Utc::now().timestamp() as u64;
+            /*
              active_reservations.with_lock(|reservations_guard| {
                  reservations_guard.drop_expired_reservations(current_timestamp)
              }).await;
             */
-
 
             analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
             analyze_reservations_for_sufficient_confirmations(
