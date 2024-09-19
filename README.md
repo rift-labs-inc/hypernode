@@ -6,5 +6,5 @@ Rust
 
 ## Run
 ```bash
-RUST_BACKTRACE=1 RUST_LOG=hypernode cargo run --release
+RUST_BACKTRACE=1 RUST_LOG=hypernode cargo run --release --bin hypernode
 ```

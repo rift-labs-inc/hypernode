@@ -3,6 +3,10 @@ name = "hypernode"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "hypernode"
+path = "src/bin/main.rs"
+
 [dependencies]
 rift-lib = { path ="./circuits/lib" }
 rift-core = { path ="./circuits/core" }

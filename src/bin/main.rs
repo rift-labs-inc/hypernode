@@ -1,77 +1,31 @@
-mod btc_indexer;
-mod btc_rpc;
-mod constants;
-mod core;
-mod evm_indexer;
-mod proof_broadcast;
-mod proof_builder;
-
 use alloy::{
     network::{Ethereum, EthereumWallet},
     providers::{Provider, ProviderBuilder, WsConnect},
     pubsub::PubSubFrontend,
     signers::{k256::elliptic_curve::ff::derive::bitvec::boxed, local::PrivateKeySigner},
 };
-use clap::Parser;
-use constants::RESERVATION_DURATION_HOURS;
-use core::{
-    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeHttp, RiftExchangeWebsocket,
-    Store, ThreadSafeStore,
-};
 use dotenv;
-use evm_indexer::fetch_token_decimals;
+use clap::Parser;
 use eyre::Result;
 use log::{info, trace, warn};
 use std::{str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Ethereum RPC websocket URL for indexing and proposing proofs onchain
-    #[arg(short, long, env)]
-    evm_ws_rpc: String,
+use hypernode::constants::RESERVATION_DURATION_HOURS;
+use hypernode::HypernodeArgs;
+use hypernode::core::{
+    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeHttp, RiftExchangeWebsocket,
+    Store, ThreadSafeStore,
+};
+use hypernode::evm_indexer::fetch_token_decimals;
+use hypernode::{evm_indexer, btc_indexer, proof_broadcast, proof_builder};
 
-    /// Bitcoin RPC URL for indexing
-    #[arg(short, long, env)]
-    btc_rpc: String,
-
-    /// Ethereum private key for signing hypernode initiated transactions
-    #[arg(short, long, env)]
-    private_key: String,
-
-    /// Rift Exchange contract address
-    #[arg(short, long, env)]
-    rift_exchange_address: String,
-
-    /// RPC concurrency limit
-    #[arg(short, long, env, default_value = "10")]
-    rpc_concurrency: usize,
-
-    /// Bitcoin new block polling interval in seconds
-    #[arg(short, long, env, default_value = "30")]
-    btc_polling_interval: u64,
-
-    /// Enable mock proof generation
-    #[arg(short, long, env, default_value = "false")]
-    mock_proof: bool,
-
-    /// Utilize Flashbots to prevent frontrunning on propose + release transactions (recommended
-    /// for mainnet)
-    #[arg(short, long, env, default_value = "false")]
-    flashbots: bool,
-
-    /// Flashbots relay URL, required if flashbots is enabled, will only be utilized when
-    /// broadcasting transactions
-    #[arg(short, long, env)]
-    flashbots_relay_rpc: Option<String>,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     dotenv::dotenv().ok();
-    let args = Args::parse();
+    let args = HypernodeArgs::parse();
     let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)?;
 
     let safe_store = Arc::new(ThreadSafeStore::new());
@@ -171,3 +125,4 @@ async fn main() -> Result<()> {
     )?;
     Ok(())
 }
+

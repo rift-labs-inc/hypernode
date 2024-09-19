@@ -4,6 +4,7 @@ use bitcoin::hex::DisplayHex;
 use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block, Script};
 use eyre::Result;
 use log::{error, info};
+use rift_core::btc_light_client::AsLittleEndianBytes;
 use rift_core::lp::LiquidityReservation;
 use rift_lib;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use crate::{
     btc_rpc::BitcoinRpcClient,
     core::{RiftExchange::RiftExchangeInstance, ThreadSafeStore},
 };
-use crypto_bigint::{AddMod, U256 as SP1OptimizedU256};
+use crypto_bigint::{AddMod, Zero, U256 as SP1OptimizedU256};
 
 fn buffer_to_18_decimals(amount: U256, token_decimals: u8) -> U256 {
     if token_decimals < 18 {
@@ -117,12 +118,14 @@ impl ProofGenerationQueue {
                 - blocks.first().unwrap().bip34_block_height().unwrap();
             let retarget_block = btc_final.retarget_block;
 
+            // TODO: Update hypernode to store the chainwork for a given safe block
             let circuit_input: rift_core::CircuitInput = rift_lib::proof::build_proof_input(
                 order_nonce,
                 &liquidity_reservations,
+                SP1OptimizedU256::ZERO, // THIS IS A PLACEHOLDER
                 &blocks,
                 proposed_block_index as usize,
-                &rift_lib::to_little_endian(proposed_txid),
+                &proposed_txid.to_little_endian(),
                 &retarget_block,
             );
             let proof_gen_timer = std::time::Instant::now();
