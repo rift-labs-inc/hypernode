@@ -120,6 +120,8 @@ impl ProofBroadcastQueue {
                     safe_block_height as u32,
                     proposed_block_height,
                     confirmation_block_height,
+                    // TODO: This is temporary, chainwork needs to be calculated and stored
+                    0,
                     block_hashes,
                     solidity_proof.into(),
                 )
