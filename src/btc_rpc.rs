@@ -111,6 +111,22 @@ impl BitcoinRpcClient {
         let block_bytes = hex::decode(block_hexstr)?;
         deserialize::<Block>(&block_bytes).map_err(|_| eyre::eyre!("Failed to deserialize block"))
     }
+
+    pub async fn get_chainwork(&self, block_hash: &[u8; 32]) -> Result<[u8; 32]> {
+        let result = self
+            .send_request(
+                "getblockheader",
+                Value::Array(vec![hex::encode(block_hash).into()]),
+            )
+            .await?;
+        let chainwork_hexstr = result
+            .get("chainwork")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| eyre::eyre!("Chainwork doesn't exist"))?;
+        let chainwork: [u8; 32] = hex::decode(chainwork_hexstr)?.as_slice().try_into()?;
+        Ok(chainwork)
+    }
+    
 }
 
 #[cfg(test)]
@@ -145,5 +161,14 @@ mod tests {
             *block.header.block_hash().as_raw_hash().as_byte_array(),
             block_hash
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_chainwork() {
+        let client = BitcoinRpcClient::new("https://bitcoin-mainnet.public.blastapi.io");
+        let block_height = 859812;
+        let block_hash = client.get_block_hash(block_height).await.unwrap();
+        let chainwork = client.get_chainwork(&block_hash).await.unwrap();
+        assert_eq!(chainwork.len(), 32);
     }
 }

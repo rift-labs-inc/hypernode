@@ -6,7 +6,7 @@ use crate::{
 };
 use alloy::network::eip2718::Encodable2718;
 use alloy::network::{Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder};
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, Uint, U256};
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider, WsConnect};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
@@ -15,11 +15,11 @@ use alloy::transports::http::Http;
 use alloy::transports::BoxTransport;
 use bitcoin::hex::DisplayHex;
 use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block, Script};
-use crypto_bigint::{AddMod, U256 as SP1OptimizedU256};
+use crypto_bigint::{AddMod, Encoding, U256 as SP1OptimizedU256};
 use eyre::Result;
 use log::{debug, error, info};
 use rift_core::lp::LiquidityReservation;
-use rift_lib;
+use rift_lib::{self, AsRiftOptimizedBlock};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
@@ -113,18 +113,39 @@ impl ProofBroadcastQueue {
                 })
                 .collect::<Vec<_>>();
 
+            let chainworks = rift_lib::transaction::get_chainworks(
+                btc_final
+                    .blocks
+                    .iter()
+                    .map(|block| block.as_rift_optimized_block())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
+            )
+            .iter()
+            .map(|chainwork| Uint::<256, 4>::from_be_bytes(chainwork.to_be_bytes()))
+            .collect::<Vec<_>>();
+
+
             let txn_calldata = contract
                 .proposeTransactionProof(
                     item.reservation_id,
                     bitcoin_tx_id.into(),
+                    FixedBytes(
+                        btc_final
+                            .blocks
+                            .first()
+                            .unwrap()
+                            .header
+                            .merkle_root
+                            .to_byte_array(),
+                    ),
                     safe_block_height as u32,
                     proposed_block_height,
                     confirmation_block_height,
-                    // TODO: This is temporary, chainwork needs to be stored and passed here for
-                    // all confrimation heights
-                    U256::from(0_u64),
                     block_hashes,
-                    solidity_proof.into(),
+                    chainworks,
+                    solidity_proof.into()
                 )
                 .calldata()
                 .to_owned();

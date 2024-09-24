@@ -87,6 +87,7 @@ pub type RiftExchangeHttp = RiftExchange::RiftExchangeInstance<Http<Client>, Arc
 pub struct BitcoinReservationFinalized {
     pub confirmation_height: u64,
     pub confirmation_block_hash: [u8; 32],
+    pub safe_block_chainwork: [u8; 32],
     pub blocks: Vec<Block>,
     pub retarget_block: Block,
 }
@@ -188,11 +189,13 @@ impl Store {
         id: U256,
         confirmation_height: u64,
         confirmation_block_hash: [u8; 32],
+        safe_block_chainwork: [u8; 32],
         blocks: Vec<Block>,
         retarget_block: Block,
     ) {
         let metadata = self.reservations.get_mut(&id).unwrap();
         metadata.btc_final = Some(BitcoinReservationFinalized {
+            safe_block_chainwork,
             confirmation_height,
             confirmation_block_hash,
             blocks,

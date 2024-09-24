@@ -122,7 +122,7 @@ impl ProofGenerationQueue {
             let circuit_input: rift_core::CircuitInput = rift_lib::proof::build_proof_input(
                 order_nonce,
                 &liquidity_reservations,
-                SP1OptimizedU256::ZERO, // THIS IS A PLACEHOLDER
+                SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
                 &blocks,
                 proposed_block_index as usize,
                 &proposed_txid.to_little_endian(),
