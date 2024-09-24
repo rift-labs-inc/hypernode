@@ -5,6 +5,7 @@ pub mod core;
 pub mod evm_indexer;
 pub mod proof_broadcast;
 pub mod proof_builder;
+pub mod node;
 
 use clap::Parser;
 
