@@ -12,11 +12,11 @@ use alloy::{
     rpc::types::{BlockTransactionsKind, Filter, TransactionInput, TransactionRequest},
     sol_types::{SolEvent, SolValue},
 };
+use core::time;
 use eyre::{Result, WrapErr};
 use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
-use log::info;
-use core::time;
+use log::{debug, info};
 use std::error::Error;
 use std::time::{Instant, UNIX_EPOCH};
 use std::{any::Any, collections::HashMap};
@@ -275,7 +275,7 @@ pub async fn find_block_height_from_time(
             .unwrap();
         let block_timestamp = block_info.header.timestamp;
 
-        if block_timestamp <= target_timestamp {
+        if block_timestamp <= target_timestamp || check_block == 0 {
             info!(
                 "Found EVM block height: {}, {:.2} hours from tip in {:?}",
                 check_block,
