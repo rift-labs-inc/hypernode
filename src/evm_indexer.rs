@@ -275,7 +275,7 @@ pub async fn find_block_height_from_time(
             .unwrap();
         let block_timestamp = block_info.header.timestamp;
 
-        if block_timestamp <= target_timestamp {
+        if block_timestamp <= target_timestamp || check_block == 0 {
             info!(
                 "Found EVM block height: {}, {:.2} hours from tip in {:?}",
                 check_block,
