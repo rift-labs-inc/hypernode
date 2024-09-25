@@ -10,6 +10,8 @@ use alloy::primitives::{Address, FixedBytes, Uint, U256};
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider, WsConnect};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
+use rift_core::btc_light_client::AsLittleEndianBytes;
+use std::ops::Index;
 
 use alloy::transports::http::Http;
 use alloy::transports::BoxTransport;
@@ -126,7 +128,6 @@ impl ProofBroadcastQueue {
             .map(|chainwork| Uint::<256, 4>::from_be_bytes(chainwork.to_be_bytes()))
             .collect::<Vec<_>>();
 
-
             let txn_calldata = contract
                 .proposeTransactionProof(
                     item.reservation_id,
@@ -134,18 +135,21 @@ impl ProofBroadcastQueue {
                     FixedBytes(
                         btc_final
                             .blocks
-                            .first()
-                            .unwrap()
+                            .index(
+                                ((proposed_block_height as u64) - (safe_block_height as u64))
+                                    as usize,
+                            )
                             .header
                             .merkle_root
-                            .to_byte_array(),
+                            .to_byte_array()
+                            .to_little_endian(),
                     ),
                     safe_block_height as u32,
                     proposed_block_height,
                     confirmation_block_height,
                     block_hashes,
                     chainworks,
-                    solidity_proof.into()
+                    solidity_proof.into(),
                 )
                 .calldata()
                 .to_owned();

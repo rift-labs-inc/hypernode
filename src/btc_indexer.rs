@@ -173,7 +173,8 @@ async fn analyze_reservations_for_sufficient_confirmations(
 
         let blocks = blocks.into_iter().collect::<Vec<_>>();
 
-        let safe_chainwork = rpc_client.get_chainwork(blocks.first().unwrap().block_hash().as_byte_array()).await?;
+        let block_hash = rpc_client.get_block_hash(*safe_height).await?;
+        let safe_chainwork = rpc_client.get_chainwork(&block_hash).await?;
 
         let retarget_block_hash = rpc_client
             .get_block_hash(safe_height - (safe_height % 2016))
