@@ -27,3 +27,4 @@ hex = "0.4.3"
 bitcoin = "0.32.2"
 crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", branch = "patch-v0.5.5" }
 chrono = "0.4.38"
+serde = "1.0.210"

@@ -36,6 +36,7 @@ sol! {
 sol!(
     #[allow(missing_docs)]
     #[sol(rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
     RiftExchange,
     "artifacts/RiftExchange.json"
 );
@@ -43,6 +44,7 @@ sol!(
 sol!(
     #[allow(missing_docs)]
     #[sol(rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
     WETH,
     "artifacts/WETH.json"
 );
@@ -50,6 +52,7 @@ sol!(
 sol!(
     #[allow(missing_docs)]
     #[sol(rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
     IERC20,
     "artifacts/IERC20.json"
 );
