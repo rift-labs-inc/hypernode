@@ -1,4 +1,3 @@
-#![feature(duration_constructors)]
 pub mod btc_indexer;
 pub mod btc_rpc;
 pub mod constants;

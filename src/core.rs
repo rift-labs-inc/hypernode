@@ -8,10 +8,10 @@ use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
 use alloy::transports::http::Http;
 use bitcoin::Block;
+use log::info;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::constants::RESERVATION_DURATION_HOURS;
@@ -160,12 +160,13 @@ impl Store {
             .reservations
             .iter()
             .filter(|&(_, metadata)| {
-                (metadata.reservation.reservationTimestamp + Duration::from_hours(RESERVATION_DURATION_HOURS).as_secs()) < current_timestamp
+                (metadata.reservation.reservationTimestamp + (RESERVATION_DURATION_HOURS * 3600)) < current_timestamp
             })
             .map(|(&id, _)| id)
             .collect();
 
         for id in stale_ids {
+            info!("Dropping stale reservation: {:?}", id);
             self.reservations.remove(&id);
         }
     }
