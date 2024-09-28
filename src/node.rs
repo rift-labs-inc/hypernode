@@ -71,6 +71,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         Arc::clone(&safe_store),
         Arc::clone(&proof_broadcast_queue),
         args.mock_proof,
+        args.proof_gen_concurrency
     ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
@@ -83,7 +84,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         Arc::clone(&flashbots_provider),
         Arc::clone(&safe_store),
         start_evm_block_height,
-        args.rpc_concurrency,
+        args.evm_rpc_concurrency,
     )
     .await?;
 
@@ -94,6 +95,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         None,
     )
     .await?;
+
 
     tokio::try_join!(
         evm_indexer::exchange_event_listener(
@@ -108,7 +110,8 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
             start_btc_block_height,
             args.btc_polling_interval,
             Arc::clone(&safe_store),
-            Arc::clone(&proof_gen_queue)
+            Arc::clone(&proof_gen_queue),
+            args.btc_rpc_concurrency
         )
     )?;
 

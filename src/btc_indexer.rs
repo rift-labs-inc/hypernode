@@ -1,6 +1,6 @@
-use futures::StreamExt;
-use futures_util::stream;
+use futures::stream::{StreamExt, TryStreamExt};
 use std::sync::Arc;
+use futures_util::stream;
 use std::time::Instant;
 
 use bitcoin::{
@@ -253,9 +253,9 @@ pub async fn block_listener(
     polling_interval: u64,
     active_reservations: Arc<ThreadSafeStore>,
     proof_gen_queue: Arc<proof_builder::ProofGenerationQueue>,
+    max_concurrent_requests: usize,
 ) -> Result<()> {
-    // user should encode user & pass into rpc url if needed
-    let rpc = BitcoinRpcClient::new(rpc_url);
+    let rpc = Arc::new(BitcoinRpcClient::new(rpc_url));
     let mut current_height = rpc.get_block_count().await?;
     let mut analyzed_height = start_block_height - 1;
     let mut total_blocks_to_sync = current_height - analyzed_height;
@@ -263,51 +263,96 @@ pub async fn block_listener(
 
     loop {
         if current_height > analyzed_height {
-            analyzed_height += 1;
-            let block = rpc
-                .get_block(&rpc.get_block_hash(analyzed_height).await?)
+            // Get the range of heights to download
+            let heights_to_download = (analyzed_height + 1)..=current_height;
+
+            info!("Downloading bitcoin blocks: {} -> {}", analyzed_height + 1, current_height);
+
+            // Download blocks concurrently
+            let blocks_with_heights: Vec<(u64, Block)> = futures::stream::iter(heights_to_download)
+                .map(|height| {
+                    let rpc = rpc.clone();
+                    async move {
+                        let block_hash = rpc.get_block_hash(height).await.map_err(|e| {
+                            eyre::eyre!("Failed to get block hash for height {}: {}", height, e)
+                        })?;
+                        let block = rpc.get_block(&block_hash).await.map_err(|e| {
+                            eyre::eyre!(
+                                "Failed to get block for hash {}: {}",
+                                block_hash.to_hex_string(bitcoin::hex::Case::Lower),
+                                e
+                            )
+                        })?;
+                        Ok((height, block)) as Result<(u64, Block), eyre::Report>
+                    }
+                })
+                .buffer_unordered(max_concurrent_requests)
+                .try_collect()
                 .await?;
 
-            let current_timestamp = chrono::Utc::now().timestamp() as u64;
-             active_reservations.with_lock(|reservations_guard| {
-                 reservations_guard.drop_expired_reservations(current_timestamp)
-             }).await;
+            // Sort blocks by height to ensure correct order
+            let mut blocks_with_heights = blocks_with_heights;
+            blocks_with_heights.sort_by_key(|(height, _)| *height);
 
-            analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
-            analyze_reservations_for_sufficient_confirmations(
-                &block,
-                Arc::clone(&active_reservations),
-                &rpc,
-                Arc::clone(&proof_gen_queue),
-            )
-            .await?;
+            for (height, block) in blocks_with_heights {
+                analyzed_height = height;
+                let current_timestamp = chrono::Utc::now().timestamp() as u64;
 
-            let blocks_synced = analyzed_height - start_block_height + 1;
-            let progress_percentage = (blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0;
-            info!(
-                "Syncing blocks: {:.2}% complete. Synced height: {}, Tip: {}",
-                progress_percentage, analyzed_height, current_height
-            );
-            fully_synced_logged = false;
+                active_reservations
+                    .with_lock(|reservations_guard| {
+                        reservations_guard.drop_expired_reservations(current_timestamp)
+                    })
+                    .await;
+
+                let sift_start = Instant::now();
+                analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
+                debug!(
+                    "Analyzed bitcoin block: {} in {:?}",
+                    analyzed_height,
+                    sift_start.elapsed()
+                );
+
+                analyze_reservations_for_sufficient_confirmations(
+                    &block,
+                    Arc::clone(&active_reservations),
+                    &rpc,
+                    Arc::clone(&proof_gen_queue),
+                )
+                .await?;
+
+                debug!(
+                    "Analyzed bitcoin block: {} for confirmations in {:?}",
+                    analyzed_height,
+                    sift_start.elapsed()
+                );
+
+                let blocks_synced = analyzed_height - start_block_height + 1;
+                let progress_percentage =
+                    (blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0;
+                info!(
+                    "Syncing bitcoin blocks: {:.2}% complete. Synced height: {}, Tip: {}",
+                    progress_percentage, analyzed_height, current_height
+                );
+                fully_synced_logged = false;
+            }
         } else {
-            // we've caught up, check for new blocks
+            // We've caught up, check for new blocks
             let new_height = rpc.get_block_count().await?;
             if new_height > current_height {
-                // new blocks available, update and continue syncing
+                // New blocks available, update and continue syncing
                 current_height = new_height;
-                // Update total_blocks_to_sync for accurate percentage calculation
                 total_blocks_to_sync = current_height - start_block_height + 1;
                 info!(
-                    "New blocks found. Continuing sync to new tip: {}",
+                    "New bitcoin blocks found. Continuing sync to new tip: {}",
                     current_height
                 );
                 fully_synced_logged = false;
             } else if !fully_synced_logged {
-                // we're fully synced, log only if not logged before
-                info!("Fully synced. Waiting for new blocks...");
+                // We're fully synced, log only if not logged before
+                info!("Fully synced. Waiting for new bitcoin blocks...");
                 fully_synced_logged = true;
             }
-            // sleep and try again
+            // Sleep and try again
             tokio::time::sleep(tokio::time::Duration::from_secs(polling_interval)).await;
         }
     }

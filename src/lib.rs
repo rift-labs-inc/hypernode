@@ -29,9 +29,13 @@ pub struct HypernodeArgs {
     #[arg(short, long, env)]
     pub rift_exchange_address: String,
 
-    /// RPC concurrency limit
+    /// Ethereum RPC concurrency limit
     #[arg(short, long, env, default_value = "10")]
-    pub rpc_concurrency: usize,
+    pub evm_rpc_concurrency: usize,
+    
+    /// Bitcoin RPC concurrency limit
+    #[arg(short, long, env, default_value = "10")]
+    pub btc_rpc_concurrency: usize,
 
     /// Bitcoin new block polling interval in seconds
     #[arg(short, long, env, default_value = "30")]
@@ -48,6 +52,10 @@ pub struct HypernodeArgs {
     /// Enable mock proof generation
     #[arg(short, long, env, default_value = "false")]
     pub mock_proof: bool,
+
+    /// Proof generation concurrency limit
+    #[arg(short, long, env, default_value = "1")]
+    pub proof_gen_concurrency: usize,
 
     /// Utilize Flashbots to prevent frontrunning on propose + release transactions (recommended
     /// for mainnet)
