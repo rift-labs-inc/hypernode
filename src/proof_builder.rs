@@ -1,26 +1,17 @@
 use alloy::primitives::U256;
-use alloy::providers::Provider;
-use bitcoin::hex::DisplayHex;
-use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block, Script};
-use eyre::Result;
 use log::{error, info};
 use rift_core::btc_light_client::AsLittleEndianBytes;
 use rift_core::lp::LiquidityReservation;
 use rift_lib;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
 
 use crate::constants::MAIN_ELF;
-use crate::core::RiftExchange;
 use crate::proof_broadcast::{self, ProofBroadcastQueue};
-use crate::{
-    btc_rpc::BitcoinRpcClient,
-    core::{RiftExchange::RiftExchangeInstance, ThreadSafeStore},
-};
-use crypto_bigint::{AddMod, Zero, U256 as SP1OptimizedU256};
+use crate::core::ThreadSafeStore;
+use crypto_bigint::U256 as SP1OptimizedU256;
 
-fn buffer_to_18_decimals(amount: U256, token_decimals: u8) -> U256 {
+pub fn buffer_to_18_decimals(amount: U256, token_decimals: u8) -> U256 {
     if token_decimals < 18 {
         amount * U256::from(10).pow(U256::from(18 - token_decimals))
     } else {
@@ -28,7 +19,7 @@ fn buffer_to_18_decimals(amount: U256, token_decimals: u8) -> U256 {
     }
 }
 
-fn unbuffer_from_18_decimals(amount: U256, token_decimals: u8) -> U256 {
+pub fn unbuffer_from_18_decimals(amount: U256, token_decimals: u8) -> U256 {
     if token_decimals < 18 {
         amount / U256::from(10).pow(U256::from(18 - token_decimals))
     } else {
@@ -36,11 +27,11 @@ fn unbuffer_from_18_decimals(amount: U256, token_decimals: u8) -> U256 {
     }
 }
 
-fn wei_to_sats(wei_amount: U256, wei_sats_exchange_rate: U256) -> U256 {
+pub fn wei_to_sats(wei_amount: U256, wei_sats_exchange_rate: U256) -> U256 {
     wei_amount / wei_sats_exchange_rate
 }
 
-fn sats_to_wei(sats_amount: U256, wei_sats_exchange_rate: U256) -> U256 {
+pub fn sats_to_wei(sats_amount: U256, wei_sats_exchange_rate: U256) -> U256 {
     sats_amount * wei_sats_exchange_rate
 }
 

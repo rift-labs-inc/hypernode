@@ -1,13 +1,11 @@
 use futures::StreamExt;
 use futures_util::stream;
-use core::time;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bitcoin::consensus::serialize;
 use bitcoin::{
-    hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, psbt::serialize, script::Builder,
-    Block, Transaction,
+    hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, script::Builder,
+    Block
 };
 use eyre::Result;
 use log::{debug, info};
@@ -100,7 +98,6 @@ async fn analyze_reservations_for_sufficient_confirmations(
     let mut available_btc_heights = header_contract_btc_block_hashes.keys().collect::<Vec<_>>();
     available_btc_heights.sort();
 
-    let current_tip = available_btc_heights.last().unwrap();
     for (id, reservation_metadata) in pending_confirmation_reservations {
         let btc_initial_metadata = reservation_metadata.btc_initial.unwrap();
         if btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA
@@ -215,7 +212,7 @@ async fn analyze_reservations_for_sufficient_confirmations(
     Ok(())
 }
 
-pub async fn find_block_height_from_time(rpc_url: &str, hours: u64) -> Result<u64> {
+pub async fn find_block_height_from_time(rpc_url: &str, hours: u64, average_seconds_between_bitcoin_blocks: u64) -> Result<u64> {
     let rpc = BitcoinRpcClient::new(rpc_url);
     let time = Instant::now();
     let current_block_height = rpc.get_block_count().await?;
@@ -224,7 +221,7 @@ pub async fn find_block_height_from_time(rpc_url: &str, hours: u64) -> Result<u6
 
     let target_timestamp = current_block_timestamp - hours * 3600;
 
-    let blocks_per_hour = 60 / 10;
+    let blocks_per_hour = 3600 / average_seconds_between_bitcoin_blocks;
     let estimated_blocks_ago = hours * blocks_per_hour;
 
     let mut check_block = current_block_height - estimated_blocks_ago;
@@ -272,11 +269,9 @@ pub async fn block_listener(
                 .await?;
 
             let current_timestamp = chrono::Utc::now().timestamp() as u64;
-            /*
              active_reservations.with_lock(|reservations_guard| {
                  reservations_guard.drop_expired_reservations(current_timestamp)
              }).await;
-            */
 
             analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
             analyze_reservations_for_sufficient_confirmations(

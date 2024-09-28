@@ -1,6 +1,3 @@
-use std::any::Any;
-
-use anyhow::Context;
 use bitcoin::consensus::deserialize;
 use bitcoin::Block;
 use eyre::{eyre, Result, WrapErr};

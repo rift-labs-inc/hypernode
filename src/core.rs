@@ -3,7 +3,7 @@ use alloy::primitives::U256;
 use alloy::providers::fillers::{
     ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
-use alloy::providers::{Provider, RootProvider};
+use alloy::providers::RootProvider;
 use alloy::pubsub::PubSubFrontend;
 use alloy::sol;
 use alloy::transports::http::Http;
@@ -11,7 +11,10 @@ use bitcoin::Block;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+use crate::constants::RESERVATION_DURATION_HOURS;
 
 sol!(
     #[allow(missing_docs)]
@@ -157,7 +160,7 @@ impl Store {
             .reservations
             .iter()
             .filter(|&(_, metadata)| {
-                (metadata.reservation.unlockTimestamp as u64) < current_timestamp
+                (metadata.reservation.reservationTimestamp + Duration::from_hours(RESERVATION_DURATION_HOURS).as_secs()) < current_timestamp
             })
             .map(|(&id, _)| id)
             .collect();

@@ -1,30 +1,20 @@
-use crate::constants::{CHALLENGE_PERIOD_MINUTES, MAIN_ELF};
-use crate::core::{EvmHttpProvider, RiftExchange, RiftExchangeWebsocket};
-use crate::{
-    btc_rpc::BitcoinRpcClient,
-    core::{RiftExchange::RiftExchangeInstance, ThreadSafeStore},
-};
+use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
+use crate::core::ThreadSafeStore;
 use alloy::network::eip2718::Encodable2718;
-use alloy::network::{Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder};
-use alloy::primitives::{Address, FixedBytes, Uint, U256};
-use alloy::providers::{Provider, ProviderBuilder, WalletProvider, WsConnect};
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{FixedBytes, Uint, U256};
+use alloy::providers::{Provider, WalletProvider};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
-use alloy::signers::local::PrivateKeySigner;
 use rift_core::btc_light_client::AsLittleEndianBytes;
 use std::ops::Index;
 
-use alloy::transports::http::Http;
-use alloy::transports::BoxTransport;
 use bitcoin::hex::DisplayHex;
-use bitcoin::{hashes::Hash, opcodes::all::OP_RETURN, script::Builder, Block, Script};
-use crypto_bigint::{AddMod, Encoding, U256 as SP1OptimizedU256};
-use eyre::Result;
-use log::{debug, error, info};
-use rift_core::lp::LiquidityReservation;
+use bitcoin::hashes::Hash;
+use crypto_bigint::{Encoding, U256 as SP1OptimizedU256};
+use log::{debug, info};
 use rift_lib::{self, AsRiftOptimizedBlock};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
 
 #[derive(Debug)]
 pub struct ProofBroadcastInput {
@@ -129,7 +119,7 @@ impl ProofBroadcastQueue {
             .collect::<Vec<_>>();
 
             let txn_calldata = contract
-                .proposeTransactionProof(
+                .submitSwapProof(
                     item.reservation_id,
                     bitcoin_tx_id.into(),
                     FixedBytes(

@@ -1,3 +1,4 @@
+#![feature(duration_constructors)]
 pub mod btc_indexer;
 pub mod btc_rpc;
 pub mod constants;
@@ -35,6 +36,14 @@ pub struct HypernodeArgs {
     /// Bitcoin new block polling interval in seconds
     #[arg(short, long, env, default_value = "30")]
     pub btc_polling_interval: u64,
+
+    /// Average time between EVM blocks in seconds
+    #[arg(short, long, env, default_value = "12")]
+    pub evm_block_time: u64,
+
+    /// Average time between Bitcoin blocks in seconds
+    #[arg(short, long, env, default_value = "600")]
+    pub btc_block_time: u64,
 
     /// Enable mock proof generation
     #[arg(short, long, env, default_value = "false")]

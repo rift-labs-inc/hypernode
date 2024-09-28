@@ -1,23 +1,17 @@
 use alloy::{
-    network::{Ethereum, EthereumWallet},
-    providers::{Provider, ProviderBuilder, WsConnect},
-    pubsub::PubSubFrontend,
-    signers::{k256::elliptic_curve::ff::derive::bitvec::boxed, local::PrivateKeySigner},
+    network::EthereumWallet,
+    providers::{ProviderBuilder, WsConnect},
+    signers::local::PrivateKeySigner,
 };
-use dotenv;
-use clap::Parser;
 use eyre::Result;
-use log::{info, trace, warn};
 use std::{str::FromStr, sync::Arc};
-use tokio::sync::Mutex;
 
 use crate::constants::RESERVATION_DURATION_HOURS;
 use crate::HypernodeArgs;
 use crate::core::{
-    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeHttp, RiftExchangeWebsocket,
-    Store, ThreadSafeStore,
+    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeWebsocket,
+    ThreadSafeStore,
 };
-use crate::evm_indexer::fetch_token_decimals;
 use crate::{evm_indexer, btc_indexer, proof_broadcast, proof_builder};
 
 pub async fn run(args: HypernodeArgs) -> Result<()> {
@@ -80,8 +74,8 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
     ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
-        evm_indexer::find_block_height_from_time(&contract, RESERVATION_DURATION_HOURS),
-        btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS)
+        evm_indexer::find_block_height_from_time(&contract, RESERVATION_DURATION_HOURS, args.evm_block_time),
+        btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS, args.btc_block_time)
     )?;
 
     let synced_reservation_evm_height = evm_indexer::sync_reservations(

@@ -1,14 +1,10 @@
 use alloy::network::eip2718::Encodable2718;
 use alloy::providers::WalletProvider;
-use alloy::transports::{BoxTransport, BoxTransportConnect, Transport};
 use alloy::{
-    contract,
     eips::{BlockId, BlockNumberOrTag},
-    network::Ethereum,
     network::TransactionBuilder,
-    primitives::{Address, Bytes, U256},
-    providers::{FilterPollerBuilder, Provider, ProviderBuilder, RootProvider, WsConnect},
-    pubsub::PubSubFrontend,
+    primitives::{ Bytes, U256},
+    providers::Provider,
     rpc::types::{BlockTransactionsKind, Filter, TransactionInput, TransactionRequest},
     sol_types::{SolEvent, SolValue},
 };
@@ -19,18 +15,16 @@ use log::info;
 use core::time;
 use std::error::Error;
 use std::time::{Instant, UNIX_EPOCH};
-use std::{any::Any, collections::HashMap};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, collections::HashMap};
 use tokio::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
-use crate::{constants::RESERVATION_DURATION_HOURS, core::RiftExchange::LiquidityReserved};
 use crate::{
-    constants::{CHALLENGE_PERIOD_MINUTES, HEADER_LOOKBACK_LIMIT},
+    constants::HEADER_LOOKBACK_LIMIT,
     core::{
-        BlockHashes, BlockHeaderAggregator, DepositVaultAggregator, ReservationMetadata,
-        RiftExchange::{self, RiftExchangeInstance, SwapReservation},
+        BlockHeaderAggregator, DepositVaultAggregator, ReservationMetadata,
+        RiftExchange::{self},
         ThreadSafeStore,
     },
 };
@@ -38,15 +32,15 @@ use crate::{
 // non blocking
 pub fn release_after_challenge_period(
     swap_reservation_index: U256,
-    unlock_timestamp: u32,
+    liquidity_unlocked_timestamp: u64,
     contract: Arc<RiftExchangeWebsocket>,
     flashbots_provider: Arc<Option<EvmHttpProvider>>,
 ) {
     tokio::spawn(async move {
-        let buffer_seconds = 30 as u32; // buffer to ensure the ethereum block timestamp is
+        let buffer_seconds = 30 as u64; // buffer to ensure the ethereum block timestamp is
                                         // past the unlock timestamp
-        let release_liquidity_timestamp = unlock_timestamp + buffer_seconds;
-        let current_timestamp = UNIX_EPOCH.elapsed().unwrap().as_secs() as u32;
+        let release_liquidity_timestamp = liquidity_unlocked_timestamp + buffer_seconds;
+        let current_timestamp = UNIX_EPOCH.elapsed().unwrap().as_secs() as u64;
         let sleep_duration = if current_timestamp > release_liquidity_timestamp {
             0
         } else {
@@ -244,6 +238,7 @@ pub async fn download_reservation(
 pub async fn find_block_height_from_time(
     rift_exchange: &RiftExchangeWebsocket,
     hours: u64,
+    average_time_between_evm_blocks: u64,
 ) -> Result<u64> {
     let time = Instant::now();
 
@@ -256,7 +251,7 @@ pub async fn find_block_height_from_time(
     let target_timestamp = current_timestamp.saturating_sub(hours * 3600);
 
     // Estimate blocks per hour (assuming ~12 second block time)
-    let blocks_per_hour = 3600 / 12;
+    let blocks_per_hour = 3600 / average_time_between_evm_blocks;
     let estimated_blocks_ago = hours * blocks_per_hour;
 
     let mut check_block = current_block
@@ -321,8 +316,8 @@ pub async fn sync_reservations(
                     log.log_decode()?.inner.data;
                 active_reservations_set.insert(reservation_event.swapReservationIndex);
             }
-            Some(&RiftExchange::ProofProposed::SIGNATURE_HASH) => {
-                let proof_proposed_event: RiftExchange::ProofProposed =
+            Some(&RiftExchange::ProofSubmitted::SIGNATURE_HASH) => {
+                let proof_proposed_event: RiftExchange::ProofSubmitted =
                     log.log_decode()?.inner.data;
                 // TODO: This is not mainnet safe, we need to validate that a proposed proof is not
                 // malicious / part of an orphan chain, instead of just removing the reservation
@@ -399,7 +394,7 @@ pub async fn sync_reservations(
         .into_iter()
         .filter(|(id, _)| reservations_in_challenge.contains(id))
         .for_each(|(id, metadata)| {
-            let unlock_timestamp = metadata.reservation.unlockTimestamp;
+            let unlock_timestamp = metadata.reservation.liquidityUnlockedTimestamp;
             let contract = Arc::clone(&contract);
             let flashbots_provider = Arc::clone(&flashbots_provider);
             release_after_challenge_period(id, unlock_timestamp, contract, flashbots_provider);
@@ -433,7 +428,7 @@ pub async fn exchange_event_listener(
         .watch()
         .await?;
     let proof_proposed_filter = contract
-        .ProofProposed_filter()
+        .ProofSubmitted_filter()
         .from_block(start_index_block_height)
         .watch()
         .await?;
@@ -501,7 +496,7 @@ pub async fn exchange_event_listener(
                     processed_logs_guard.insert(log_identifier);
                     drop(processed_logs_guard);
 
-                    info!("ProofProposed w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
+                    info!("ProofSubmitted w/ reservation index: {:?}", &log_data.0.swapReservationIndex);
                     let swap_reservation_index = log_data.0.swapReservationIndex;
                     let reservation_metadata = download_reservation(swap_reservation_index, Arc::clone(&contract)).await?;
                     active_reservations.with_lock(|reservations_guard| {
@@ -510,7 +505,7 @@ pub async fn exchange_event_listener(
 
                     release_after_challenge_period(
                         swap_reservation_index,
-                        reservation_metadata.1.reservation.unlockTimestamp,
+                        reservation_metadata.1.reservation.liquidityUnlockedTimestamp,
                         Arc::clone(&contract),
                         Arc::clone(&flashbots_provider)
                     );
