@@ -138,10 +138,12 @@ impl ProofGenerationQueue {
                     order_nonce,
                     &liquidity_reservations,
                     SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
+                    btc_final.safe_block_height,
                     &blocks,
                     proposed_block_index as usize,
                     &proposed_txid.to_little_endian(),
                     &retarget_block,
+                    btc_final.retarget_block_height,
                 );
                 let proof_gen_timer = std::time::Instant::now();
                 info!("TEST 7 Proof generation started for reservation_id: {:?}", item_clone.reservation_id);

@@ -99,7 +99,8 @@ impl ProofBroadcastQueue {
                 btc_final
                     .blocks
                     .iter()
-                    .map(|block| block.as_rift_optimized_block())
+                    .zip(safe_block_height..block_hashes.len() as u64)
+                    .map(|(block, height)| block.as_rift_optimized_block(height))
                     .collect::<Vec<_>>()
                     .as_slice(),
                 SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
