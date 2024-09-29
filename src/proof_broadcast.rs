@@ -1,15 +1,20 @@
-use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
 use crate::core::ThreadSafeStore;
+use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
+use alloy::eips::BlockNumberOrTag;
 use alloy::network::eip2718::Encodable2718;
-use alloy::network::TransactionBuilder;
+use alloy::network::{NetworkWallet, TransactionBuilder};
 use alloy::primitives::{FixedBytes, Uint, U256};
+use alloy::providers::ext::{DebugApi, TraceApi};
 use alloy::providers::{Provider, WalletProvider};
+use alloy::rpc::types::trace::geth::GethDebugTracingCallOptions;
+use alloy::rpc::types::trace::parity::TraceType;
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use rift_core::btc_light_client::AsLittleEndianBytes;
+use serde::Serialize;
 use std::ops::Index;
 
-use bitcoin::hex::DisplayHex;
 use bitcoin::hashes::Hash;
+use bitcoin::hex::DisplayHex;
 use crypto_bigint::{Encoding, U256 as SP1OptimizedU256};
 use log::{debug, error, info};
 use rift_lib::{self, AsRiftOptimizedBlock};
@@ -84,7 +89,7 @@ impl ProofBroadcastQueue {
 
             let proposed_block_height = btc_initial.proposed_block_height;
             let safe_block_height = btc_final.safe_block_height;
-            let confirmation_block_height = btc_final.confirmation_height; 
+            let confirmation_block_height = btc_final.confirmation_height;
             let block_hashes = btc_final
                 .blocks
                 .iter()
@@ -167,17 +172,18 @@ impl ProofBroadcastQueue {
             } else {
                 let tx = TransactionRequest::default()
                     .to(*contract.address())
-                    .input(TransactionInput::new(txn_calldata));
+                    .input(TransactionInput::new(txn_calldata.clone()));
 
-                match provider
-                    .send_transaction(tx)
-                    .await {
-                        Ok(tx) => tx.tx_hash().to_owned(),
-                        Err(e) => {
-                            error!("Failed to broadcast proof: {:?}", e);
-                            continue;
-                        }
+                match provider.send_transaction(tx.clone()).await {
+                    Ok(tx) => tx.tx_hash().to_owned(),
+                    Err(e) => {
+                        error!("Failed to broadcast proof: {:?}", e);
+                        let data = txn_calldata.as_hex();
+                        let to = contract.address().to_string();
+                        info!("cast call {} --data {} --trace", to, data);
+                        continue;
                     }
+                }
             };
 
             info!("Proof broadcasted with evm tx hash: {}", tx_hash);
