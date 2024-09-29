@@ -24,6 +24,7 @@ fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
 }
 
 async fn analyze_block_for_payments(
+    height: u64,
     block: &Block,
     active_reservations: Arc<ThreadSafeStore>,
 ) -> Result<()> {
@@ -44,18 +45,17 @@ async fn analyze_block_for_payments(
         for script in tx.output.iter().map(|out| out.script_pubkey.clone()) {
             for (id, expected_script) in expected_order_inscriptions.iter() {
                 if script.as_bytes() == expected_script {
-                    let block_height = block.bip34_block_height()? as u64;
                     info!(
                         "Found payment for reservation: {}, txid: {} at block height: {}",
                         id,
                         tx.compute_txid(),
-                        block_height
+                        height 
                     );
                     active_reservations
                         .with_lock(|reservations_guard| {
                             reservations_guard.update_btc_reservation_initial(
                                 *id,
-                                block_height,
+                                height,
                                 *block.block_hash().as_raw_hash().as_byte_array(),
                                 *tx.compute_txid().as_byte_array(),
                             );
@@ -70,6 +70,7 @@ async fn analyze_block_for_payments(
 }
 
 async fn analyze_reservations_for_sufficient_confirmations(
+    height: u64,
     block: &Block,
     active_reservations: Arc<ThreadSafeStore>,
     rpc_client: &BitcoinRpcClient,
@@ -94,20 +95,19 @@ async fn analyze_reservations_for_sufficient_confirmations(
         .with_lock(|reservations_guard| reservations_guard.safe_contract_block_hashes.clone())
         .await;
 
-    let current_btc_block_height = block.bip34_block_height()? as u64;
     let mut available_btc_heights = header_contract_btc_block_hashes.keys().collect::<Vec<_>>();
     available_btc_heights.sort();
 
     for (id, reservation_metadata) in pending_confirmation_reservations {
         let btc_initial_metadata = reservation_metadata.btc_initial.unwrap();
         if btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA
-            > current_btc_block_height
+            > height 
         {
             info!(
                 "Reservation: {} not confirmed yet, need {} more confirmations",
                 id,
                 btc_initial_metadata.proposed_block_height + CONFIRMATION_HEIGHT_DELTA
-                    - current_btc_block_height
+                    - height 
             );
             // not enough confirmations yet
             continue;
@@ -173,14 +173,16 @@ async fn analyze_reservations_for_sufficient_confirmations(
         let block_hash = rpc_client.get_block_hash(*safe_height).await?;
         let safe_chainwork = rpc_client.get_chainwork(&block_hash).await?;
 
+        let retarget_height = safe_height - (safe_height % 2016);
+
         let retarget_block_hash = rpc_client
-            .get_block_hash(safe_height - (safe_height % 2016))
+            .get_block_hash(retarget_height)
             .await?;
         let retarget_block = rpc_client.get_block(&retarget_block_hash).await?;
 
         debug!(
             "Retarget block height: {}, reservation: {}",
-            retarget_block.bip34_block_height().unwrap(),
+            retarget_height,
             id
         );
         debug!(
@@ -197,9 +199,11 @@ async fn analyze_reservations_for_sufficient_confirmations(
                     id.clone(),
                     *confirmation_height,
                     *block.block_hash().as_raw_hash().as_byte_array(),
+                    *safe_height,
                     safe_chainwork,
                     blocks,
                     retarget_block,
+                    retarget_height,
                 );
             })
             .await;
@@ -212,27 +216,30 @@ async fn analyze_reservations_for_sufficient_confirmations(
     Ok(())
 }
 
-pub async fn find_block_height_from_time(rpc_url: &str, hours: u64, average_seconds_between_bitcoin_blocks: u64) -> Result<u64> {
+pub async fn find_block_height_from_time(
+    rpc_url: &str,
+    hours: u64,
+    average_seconds_between_bitcoin_blocks: u64
+) -> Result<u64> {
     let rpc = BitcoinRpcClient::new(rpc_url);
     let time = Instant::now();
     let current_block_height = rpc.get_block_count().await?;
     let current_block_hash = rpc.get_block_hash(current_block_height).await?;
     let current_block_timestamp = rpc.get_block(&current_block_hash).await?.header.time as u64;
-
     let target_timestamp = current_block_timestamp - hours * 3600;
-
     let blocks_per_hour = 3600 / average_seconds_between_bitcoin_blocks;
     let estimated_blocks_ago = hours * blocks_per_hour;
+    let mut check_block = current_block_height.saturating_sub(estimated_blocks_ago);
+    let mut previous_check_block = check_block + 1;
 
-    let mut check_block = current_block_height - estimated_blocks_ago;
-
-    loop {
+    while check_block > 0 && check_block != previous_check_block {
+        previous_check_block = check_block;
         let block_hash = rpc.get_block_hash(check_block).await?;
         let block_timestamp = rpc.get_block(&block_hash).await?.header.time as u64;
 
         if block_timestamp <= target_timestamp {
             info!(
-                "Found Bitcoin block height: {}, {:.2} from tip in {:?}",
+                "Found Bitcoin block height: {}, {:.2} hours from tip in {:?}",
                 check_block,
                 (current_block_timestamp - block_timestamp) as f64 / 3600 as f64,
                 time.elapsed()
@@ -240,8 +247,15 @@ pub async fn find_block_height_from_time(rpc_url: &str, hours: u64, average_seco
             return Ok(check_block);
         }
 
-        check_block -= blocks_per_hour;
+        check_block = check_block.saturating_sub(blocks_per_hour);
     }
+
+    info!(
+        "Returning closest found block height: {}, search completed in {:?}",
+        check_block,
+        time.elapsed()
+    );
+    Ok(check_block)
 }
 
 // analyzes every btc block in the range [start_block_height, current_height] for reservation
@@ -257,8 +271,8 @@ pub async fn block_listener(
 ) -> Result<()> {
     let rpc = Arc::new(BitcoinRpcClient::new(rpc_url));
     let mut current_height = rpc.get_block_count().await?;
-    let mut analyzed_height = start_block_height - 1;
-    let mut total_blocks_to_sync = current_height - analyzed_height;
+    let mut analyzed_height = start_block_height.saturating_sub(1);
+    let mut total_blocks_to_sync = current_height.saturating_sub(start_block_height);
     let mut fully_synced_logged = false;
 
     loop {
@@ -305,7 +319,7 @@ pub async fn block_listener(
                     .await;
 
                 let sift_start = Instant::now();
-                analyze_block_for_payments(&block, Arc::clone(&active_reservations)).await?;
+                analyze_block_for_payments(analyzed_height, &block, Arc::clone(&active_reservations)).await?;
                 debug!(
                     "Analyzed bitcoin block: {} in {:?}",
                     analyzed_height,
@@ -313,6 +327,7 @@ pub async fn block_listener(
                 );
 
                 analyze_reservations_for_sufficient_confirmations(
+                    analyzed_height,
                     &block,
                     Arc::clone(&active_reservations),
                     &rpc,

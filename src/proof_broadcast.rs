@@ -83,18 +83,8 @@ impl ProofBroadcastQueue {
             bitcoin_tx_id.reverse();
 
             let proposed_block_height = btc_initial.proposed_block_height;
-            let safe_block_height = btc_final
-                .blocks
-                .first()
-                .unwrap()
-                .bip34_block_height()
-                .unwrap();
-            let confirmation_block_height = btc_final
-                .blocks
-                .last()
-                .unwrap()
-                .bip34_block_height()
-                .unwrap();
+            let safe_block_height = btc_final.safe_block_height;
+            let confirmation_block_height = btc_final.confirmation_height; 
             let block_hashes = btc_final
                 .blocks
                 .iter()
@@ -190,3 +180,4 @@ impl ProofBroadcastQueue {
         }
     }
 }
+
