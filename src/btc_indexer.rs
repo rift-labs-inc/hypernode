@@ -343,7 +343,7 @@ pub async fn block_listener(
 
                 let blocks_synced = analyzed_height - start_block_height + 1;
                 let progress_percentage =
-                    (blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0;
+                    ((blocks_synced as f64 / total_blocks_to_sync as f64) * 100.0).clamp(0.0, 100.0);
                 info!(
                     "Syncing bitcoin blocks: {:.2}% complete. Synced height: {}, Tip: {}",
                     progress_percentage, analyzed_height, current_height
