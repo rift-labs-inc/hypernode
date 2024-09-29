@@ -1,16 +1,11 @@
 use crate::core::ThreadSafeStore;
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
-use alloy::eips::BlockNumberOrTag;
 use alloy::network::eip2718::Encodable2718;
-use alloy::network::{NetworkWallet, TransactionBuilder};
+use alloy::network::TransactionBuilder;
 use alloy::primitives::{FixedBytes, Uint, U256};
-use alloy::providers::ext::{DebugApi, TraceApi};
 use alloy::providers::{Provider, WalletProvider};
-use alloy::rpc::types::trace::geth::GethDebugTracingCallOptions;
-use alloy::rpc::types::trace::parity::TraceType;
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use rift_core::btc_light_client::AsLittleEndianBytes;
-use serde::Serialize;
 use std::ops::Index;
 
 use bitcoin::hashes::Hash;
