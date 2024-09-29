@@ -11,7 +11,7 @@ use std::ops::Index;
 use bitcoin::hex::DisplayHex;
 use bitcoin::hashes::Hash;
 use crypto_bigint::{Encoding, U256 as SP1OptimizedU256};
-use log::{debug, info};
+use log::{debug, error, info};
 use rift_lib::{self, AsRiftOptimizedBlock};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -99,7 +99,7 @@ impl ProofBroadcastQueue {
                 btc_final
                     .blocks
                     .iter()
-                    .zip(safe_block_height..block_hashes.len() as u64)
+                    .zip(safe_block_height..safe_block_height + block_hashes.len() as u64)
                     .map(|(block, height)| block.as_rift_optimized_block(height))
                     .collect::<Vec<_>>()
                     .as_slice(),
@@ -169,16 +169,18 @@ impl ProofBroadcastQueue {
                     .to(*contract.address())
                     .input(TransactionInput::new(txn_calldata));
 
-                provider
+                match provider
                     .send_transaction(tx)
-                    .await
-                    .unwrap()
-                    .tx_hash()
-                    .to_owned()
+                    .await {
+                        Ok(tx) => tx.tx_hash().to_owned(),
+                        Err(e) => {
+                            error!("Failed to broadcast proof: {:?}", e);
+                            continue;
+                        }
+                    }
             };
 
             info!("Proof broadcasted with evm tx hash: {}", tx_hash);
         }
     }
 }
-

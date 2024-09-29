@@ -94,21 +94,17 @@ impl ProofGenerationQueue {
             let mock_proof_gen_clone = mock_proof_gen;
             let item_clone = item.clone();
 
-            info!("TEST 1 reservation_id: {:?}", item.reservation_id);
             tokio::spawn(async move {
-                info!("TEST 2 reservation_id: {:?}", item_clone.reservation_id);
                 // Processing code here
                 let reservation_metadata = store_clone
                     .with_lock(|store| store.get(item_clone.reservation_id).unwrap().clone())
                     .await;
 
-                info!("TEST 3 reservation_id: {:?}", item_clone.reservation_id);
 
                 let order_nonce = reservation_metadata.reservation.nonce.0.as_slice()[..32]
                     .try_into()
                     .unwrap();
 
-                info!("TEST 4 reservation_id: {:?}", item_clone.reservation_id);
                 let reserved_vaults = reservation_metadata.reserved_vaults;
                 let expected_sats_per_lp = reservation_metadata.reservation.expectedSatsOutput;
                 let liquidity_reservations = reserved_vaults
@@ -120,7 +116,6 @@ impl ProofGenerationQueue {
                     })
                     .collect::<Vec<_>>();
 
-                info!("TEST 5 reservation_id: {:?}", item_clone.reservation_id);
 
                 let btc_final = reservation_metadata.btc_final.unwrap();
                 let btc_initial = reservation_metadata.btc_initial.unwrap();
@@ -131,7 +126,6 @@ impl ProofGenerationQueue {
                     - btc_final.safe_block_height;
                 let retarget_block = btc_final.retarget_block;
 
-                info!("TEST 6 reservation_id: {:?}", item_clone.reservation_id);
 
                 // TODO: Update hypernode to store the chainwork for a given safe block
                 let circuit_input: rift_core::CircuitInput = rift_lib::proof::build_proof_input(
@@ -146,7 +140,6 @@ impl ProofGenerationQueue {
                     btc_final.retarget_block_height,
                 );
                 let proof_gen_timer = std::time::Instant::now();
-                info!("TEST 7 Proof generation started for reservation_id: {:?}", item_clone.reservation_id);
                 let result = tokio::task::spawn_blocking(move || {
                     let (public_values_string, execution_report) =
                         rift_lib::proof::execute(circuit_input, MAIN_ELF);
