@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::constants::MAIN_ELF;
 use crate::core::ThreadSafeStore;
 use crate::proof_broadcast::{self, ProofBroadcastQueue};
+use crate::{hyper_err, Result};
+use crate::error::HypernodeError;
 use crypto_bigint::U256 as SP1OptimizedU256;
 
 pub fn buffer_to_18_decimals(amount: U256, token_decimals: u8) -> U256 {
@@ -72,10 +74,10 @@ impl ProofGenerationQueue {
         queue
     }
 
-    pub fn add(&self, proof_args: ProofGenerationInput) {
+    pub fn add(&self, proof_args: ProofGenerationInput) -> Result<()> {
         self.sender
             .send(proof_args)
-            .expect("Failed to add to proof generation queue");
+            .map_err(|e| hyper_err!(Queue, "Failed to add to proof generation queue: {}", e))
     }
 
     async fn consume_task(
@@ -88,115 +90,122 @@ impl ProofGenerationQueue {
         let semaphore = Arc::new(Semaphore::new(concurrency_limit));
 
         while let Some(item) = receiver.recv().await {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    error!("Failed to acquire semaphore permit: {}", e);
+                    continue;
+                }
+            };
             let store_clone = store.clone();
             let proof_broadcast_queue_clone = proof_broadcast_queue.clone();
             let mock_proof_gen_clone = mock_proof_gen;
             let item_clone = item.clone();
 
             tokio::spawn(async move {
-                // Processing code here
-                let reservation_metadata = store_clone
-                    .with_lock(|store| store.get(item_clone.reservation_id).unwrap().clone())
-                    .await;
-
-
-                let order_nonce = reservation_metadata.reservation.nonce.0.as_slice()[..32]
-                    .try_into()
-                    .unwrap();
-
-                let reserved_vaults = reservation_metadata.reserved_vaults;
-                let expected_sats_per_lp = reservation_metadata.reservation.expectedSatsOutput;
-                let liquidity_reservations = reserved_vaults
-                    .iter()
-                    .zip(expected_sats_per_lp.iter())
-                    .map(|(vault, sats)| LiquidityReservation {
-                        expected_sats: *sats,
-                        script_pub_key: *vault.btcPayoutLockingScript,
-                    })
-                    .collect::<Vec<_>>();
-
-
-                let btc_final = reservation_metadata.btc_final.unwrap();
-                let btc_initial = reservation_metadata.btc_initial.unwrap();
-                let blocks = btc_final.blocks;
-
-                let proposed_txid = btc_initial.txid;
-                let proposed_block_index = btc_initial.proposed_block_height
-                    - btc_final.safe_block_height;
-                let retarget_block = btc_final.retarget_block;
-
-
-                // TODO: Update hypernode to store the chainwork for a given safe block
-                let circuit_input: rift_core::CircuitInput = rift_lib::proof::build_proof_input(
-                    order_nonce,
-                    &liquidity_reservations,
-                    SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
-                    btc_final.safe_block_height,
-                    &blocks,
-                    proposed_block_index as usize,
-                    &proposed_txid.to_little_endian(),
-                    &retarget_block,
-                    btc_final.retarget_block_height,
-                );
-                let proof_gen_timer = std::time::Instant::now();
-                let result = tokio::task::spawn_blocking(move || {
-                    let (public_values_string, execution_report) =
-                        rift_lib::proof::execute(circuit_input, MAIN_ELF);
-                    info!(
-                        "Reservation {} executed with {} cycles",
-                        item_clone.reservation_id,
-                        execution_report.total_instruction_count()
-                    );
-                    if mock_proof_gen_clone {
-                        (Vec::new(), public_values_string)
-                    } else {
-                        let proof = rift_lib::proof::generate_plonk_proof(
-                            circuit_input,
-                            MAIN_ELF,
-                            Some(true),
-                        );
-                        let solidity_proof_bytes = proof.bytes();
-                        (solidity_proof_bytes, public_values_string)
-                    }
-                })
-                .await;
-
-                match result {
-                    Ok(proof) => {
-                        let solidity_proof_bytes = proof.0;
-                        info!(
-                            "Proof generation for reservation_id: {:?} took: {:?}",
-                            item_clone.reservation_id,
-                            proof_gen_timer.elapsed()
-                        );
-                        info!("Public Inputs Encoded: {:?}", proof.1);
-                        // update the reservation with the proof
-                        store_clone
-                            .with_lock(|store| {
-                                store.update_proof(item_clone.reservation_id, solidity_proof_bytes)
-                            })
-                            .await;
-
-                        proof_broadcast_queue_clone.add(proof_broadcast::ProofBroadcastInput::new(
-                            item_clone.reservation_id,
-                        ));
-                    }
-                    Err(e) => {
-                        error!(
-                            "Error generating proof for reservation_id: {:?}, error: {:?}",
-                            item_clone.reservation_id, e
-                        );
-                    }
+                if let Err(e) = Self::process_item(
+                    item_clone,
+                    store_clone,
+                    proof_broadcast_queue_clone,
+                    mock_proof_gen_clone,
+                )
+                .await
+                {
+                    error!("Error processing proof generation item: {}", e);
                 }
-                info!(
-                    "Finished processing reservation_id: {:?}",
-                    item_clone.reservation_id
-                );
-
-                // When the async block ends, the permit is automatically released
                 drop(permit);
             });
         }
+    }
+
+    async fn process_item(
+        item: ProofGenerationInput,
+        store: Arc<ThreadSafeStore>,
+        proof_broadcast_queue: Arc<ProofBroadcastQueue>,
+        mock_proof_gen: bool,
+    ) -> Result<()> {
+        let reservation_metadata = store
+            .with_lock(|store| store.get(item.reservation_id).cloned())
+            .await
+            .ok_or_else(|| hyper_err!(Store, "Reservation not found: {}", item.reservation_id))?;
+
+        let order_nonce = reservation_metadata
+            .reservation
+            .nonce
+            .0
+            .as_slice()
+            .get(..32)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| hyper_err!(ProofGeneration, "Invalid order nonce"))?;
+
+        let reserved_vaults = reservation_metadata.reserved_vaults;
+        let expected_sats_per_lp = reservation_metadata.reservation.expectedSatsOutput;
+        let liquidity_reservations = reserved_vaults
+            .iter()
+            .zip(expected_sats_per_lp.iter())
+            .map(|(vault, sats)| LiquidityReservation {
+                expected_sats: *sats,
+                script_pub_key: *vault.btcPayoutLockingScript,
+            })
+            .collect::<Vec<_>>();
+
+        let btc_final = reservation_metadata.btc_final
+            .ok_or_else(|| hyper_err!(ProofGeneration, "BTC final data not found"))?;
+        let btc_initial = reservation_metadata.btc_initial
+            .ok_or_else(|| hyper_err!(ProofGeneration, "BTC initial data not found"))?;
+        let blocks = btc_final.blocks;
+
+        let proposed_txid = btc_initial.txid;
+        let proposed_block_index = btc_initial.proposed_block_height - btc_final.safe_block_height;
+        let retarget_block = btc_final.retarget_block;
+
+        let circuit_input = rift_lib::proof::build_proof_input(
+            order_nonce,
+            &liquidity_reservations,
+            SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
+            btc_final.safe_block_height,
+            &blocks,
+            proposed_block_index as usize,
+            &proposed_txid.to_little_endian(),
+            &retarget_block,
+            btc_final.retarget_block_height,
+        );
+
+        let proof_gen_timer = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            let (public_values_string, execution_report) =
+                rift_lib::proof::execute(circuit_input, MAIN_ELF);
+            info!(
+                "Reservation {} executed with {} cycles",
+                item.reservation_id,
+                execution_report.total_instruction_count()
+            );
+            if mock_proof_gen {
+                (Vec::new(), public_values_string)
+            } else {
+                let proof = rift_lib::proof::generate_plonk_proof(circuit_input, MAIN_ELF, Some(true));
+                let solidity_proof_bytes = proof.bytes();
+                (solidity_proof_bytes, public_values_string)
+            }
+        })
+        .await
+        .map_err(|e| hyper_err!(ProofGeneration, "Proof generation task panicked: {}", e))?;
+
+        let (solidity_proof_bytes, public_values_string) = result;
+        info!(
+            "Proof generation for reservation_id: {:?} took: {:?}",
+            item.reservation_id,
+            proof_gen_timer.elapsed()
+        );
+        info!("Public Inputs Encoded: {:?}", public_values_string);
+
+        store
+            .with_lock(|store| store.update_proof(item.reservation_id, solidity_proof_bytes))
+            .await;
+
+        proof_broadcast_queue.add(proof_broadcast::ProofBroadcastInput::new(item.reservation_id))?;
+
+        info!("Finished processing reservation_id: {:?}", item.reservation_id);
+        Ok(())
     }
 }

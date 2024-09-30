@@ -6,8 +6,11 @@ pub mod evm_indexer;
 pub mod proof_broadcast;
 pub mod proof_builder;
 pub mod node;
+pub mod error;
 
 use clap::Parser;
+
+pub type Result<T> = std::result::Result<T, error::HypernodeError>;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -57,7 +60,7 @@ pub struct HypernodeArgs {
     pub proof_gen_concurrency: usize,
 
     /// Utilize Flashbots to prevent frontrunning on propose + release transactions (recommended
-    /// for mainnet)
+    /// for public mempool EVM chains that support Flashbots)
     #[arg(short, long, env, default_value = "false")]
     pub flashbots: bool,
 

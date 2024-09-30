@@ -3,9 +3,7 @@ use alloy::{
     providers::{ProviderBuilder, WsConnect},
     signers::local::PrivateKeySigner,
 };
-use eyre::Result;
 use std::{str::FromStr, sync::Arc};
-
 use crate::constants::RESERVATION_DURATION_HOURS;
 use crate::HypernodeArgs;
 use crate::core::{
@@ -13,27 +11,29 @@ use crate::core::{
     ThreadSafeStore,
 };
 use crate::{evm_indexer, btc_indexer, proof_broadcast, proof_builder};
+use crate::{hyper_err, Result};
+use crate::error::HypernodeError;
 
 pub async fn run(args: HypernodeArgs) -> Result<()> {
-    let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)?;
+    let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)
+        .map_err(|e| hyper_err!(Parse, "Failed to parse Rift exchange address: {}", e))?;
 
     let safe_store = Arc::new(ThreadSafeStore::new());
 
     let flashbots_url = if args.flashbots {
-        Some(
-            args.flashbots_relay_rpc
-                .as_ref()
-                .ok_or_else(|| {
-                    eyre::eyre!("Flashbots relay URL is required when flashbots is enabled")
-                })?
-                .clone(),
-        )
+        Some(args.flashbots_relay_rpc
+            .as_ref()
+            .ok_or_else(|| hyper_err!(Config, "Flashbots relay URL is required when flashbots is enabled"))?
+            .clone())
     } else {
         None
     };
 
-    let private_key: [u8; 32] =
-        hex::decode(args.private_key.trim_start_matches("0x"))?[..32].try_into()?;
+    let private_key: [u8; 32] = hex::decode(args.private_key.trim_start_matches("0x"))
+        .map_err(|e| hyper_err!(Parse, "Failed to decode private key: {}", e))?
+        .get(..32)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| hyper_err!(Parse, "Invalid private key length"))?;
 
     let provider: Arc<EvmWebsocketProvider> = Arc::new(
         ProviderBuilder::new()
@@ -43,7 +43,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
             ))
             .on_ws(WsConnect::new(&args.evm_ws_rpc))
             .await
-            .expect("Failed to connect to WebSocket"),
+            .map_err(|e| hyper_err!(Connection, "Failed to connect to WebSocket: {}", e))?
     );
 
     let contract: Arc<RiftExchangeWebsocket> =
@@ -57,7 +57,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
                 .wallet(EthereumWallet::from(
                     PrivateKeySigner::from_bytes(&private_key.into()).unwrap(),
                 ))
-                .on_http(url.parse()?),
+                .on_http(url.parse().map_err(|e| hyper_err!(Parse, "Failed to parse Flashbots URL: {}", e))?)
         ),
     });
 
@@ -77,7 +77,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
         evm_indexer::find_block_height_from_time(&contract, RESERVATION_DURATION_HOURS, args.evm_block_time),
         btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS, args.btc_block_time)
-    )?;
+    ).map_err(|e| hyper_err!(Indexer, "Failed to find starting block heights: {}", e))?;
 
     let synced_reservation_evm_height = evm_indexer::sync_reservations(
         Arc::clone(&contract),
@@ -86,7 +86,8 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         start_evm_block_height,
         args.evm_rpc_concurrency,
     )
-    .await?;
+    .await
+    .map_err(|e| hyper_err!(Indexer, "Failed to sync reservations: {}", e))?;
 
     let synced_block_header_evm_height = evm_indexer::download_safe_bitcoin_headers(
         Arc::clone(&contract),
@@ -94,8 +95,8 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         None,
         None,
     )
-    .await?;
-
+    .await
+    .map_err(|e| hyper_err!(Indexer, "Failed to download safe Bitcoin headers: {}", e))?;
 
     tokio::try_join!(
         evm_indexer::exchange_event_listener(
@@ -113,7 +114,8 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
             Arc::clone(&proof_gen_queue),
             args.btc_rpc_concurrency
         )
-    )?;
+    )
+    .map_err(|e| hyper_err!(Listener, "Event listener or block listener failed: {}", e))?;
 
     Ok(())
 }
