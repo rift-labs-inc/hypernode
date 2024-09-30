@@ -11,14 +11,13 @@ use alloy::{
 };
 use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
-use log::{info, error};
+use log::{error, info};
 use std::time::{Instant, UNIX_EPOCH};
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tokio::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
-use crate::{hyper_err, Result};
 use crate::error::HypernodeError;
 use crate::{
     constants::HEADER_LOOKBACK_LIMIT,
@@ -28,6 +27,7 @@ use crate::{
         ThreadSafeStore,
     },
 };
+use crate::{hyper_err, Result};
 
 // non blocking
 pub fn release_after_challenge_period(
@@ -49,7 +49,10 @@ pub fn release_after_challenge_period(
         );
         sleep(Duration::from_secs(sleep_duration)).await;
 
-        let txn_calldata = contract.releaseLiquidity(swap_reservation_index).calldata().to_owned();
+        let txn_calldata = contract
+            .releaseLiquidity(swap_reservation_index)
+            .calldata()
+            .to_owned();
         let tx = TransactionRequest::default()
             .to(*contract.address())
             .input(TransactionInput::new(txn_calldata));
@@ -73,17 +76,29 @@ async fn release_via_flashbots(
     flashbots_provider: &EvmHttpProvider,
     tx: TransactionRequest,
 ) -> Result<TxHash> {
-    let filled_tx = contract.provider().fill(tx).await
+    let filled_tx = contract
+        .provider()
+        .fill(tx)
+        .await
         .map_err(|e| hyper_err!(Evm, "Failed to fill transaction: {}", e))?;
 
-    let tx_envelope = filled_tx.as_builder().unwrap().clone().build(&contract.provider().wallet()).await
+    let tx_envelope = filled_tx
+        .as_builder()
+        .unwrap()
+        .clone()
+        .build(&contract.provider().wallet())
+        .await
         .map_err(|e| hyper_err!(Evm, "Failed to build transaction: {}", e))?;
 
     let tx_encoded = tx_envelope.encoded_2718();
-    let pending = flashbots_provider.send_raw_transaction(&tx_encoded).await
+    let pending = flashbots_provider
+        .send_raw_transaction(&tx_encoded)
+        .await
         .map_err(|e| hyper_err!(Evm, "Failed to send raw transaction: {}", e))?;
 
-    let registered = pending.register().await
+    let registered = pending
+        .register()
+        .await
         .map_err(|e| hyper_err!(Evm, "Failed to register transaction: {}", e))?;
 
     Ok(registered.tx_hash().clone())
@@ -93,7 +108,10 @@ async fn release_standard(
     contract: Arc<RiftExchangeWebsocket>,
     tx: TransactionRequest,
 ) -> Result<TxHash> {
-    let pending = contract.provider().send_transaction(tx).await
+    let pending = contract
+        .provider()
+        .send_transaction(tx)
+        .await
         .map_err(|e| hyper_err!(Evm, "Failed to send transaction: {}", e))?;
 
     Ok(pending.tx_hash().clone())
@@ -357,7 +375,6 @@ pub async fn sync_reservations(
             _ => {}
         }
     }
-
 
     let reservations_to_download: HashSet<U256> = active_reservations_set
         .union(&reservations_in_challenge)

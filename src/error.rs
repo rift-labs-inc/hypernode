@@ -1,6 +1,6 @@
+use crate::Result;
 use eyre::eyre;
 use thiserror::Error;
-use crate::Result;
 
 #[derive(Error, Debug)]
 pub enum HypernodeError {
@@ -33,7 +33,7 @@ pub enum HypernodeError {
     #[error("Listener error: {0}")]
     Listener(String),
     #[error("Unknown error: {0}")]
-    Unknown(String)
+    Unknown(String),
 }
 
 impl From<eyre::Report> for HypernodeError {
@@ -51,7 +51,6 @@ macro_rules! hyper_err {
         HypernodeError::$variant(format!($fmt, $($arg)*))
     };
 }
-
 
 pub fn to_eyre_result<T>(result: Result<T>) -> Result<T> {
     Ok(result.map_err(|e| eyre!(e))?)

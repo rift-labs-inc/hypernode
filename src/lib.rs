@@ -2,11 +2,11 @@ pub mod btc_indexer;
 pub mod btc_rpc;
 pub mod constants;
 pub mod core;
+pub mod error;
 pub mod evm_indexer;
+pub mod node;
 pub mod proof_broadcast;
 pub mod proof_builder;
-pub mod node;
-pub mod error;
 
 use clap::Parser;
 
@@ -34,7 +34,7 @@ pub struct HypernodeArgs {
     /// Ethereum RPC concurrency limit
     #[arg(short, long, env, default_value = "10")]
     pub evm_rpc_concurrency: usize,
-    
+
     /// Bitcoin RPC concurrency limit
     #[arg(short, long, env, default_value = "10")]
     pub btc_rpc_concurrency: usize,

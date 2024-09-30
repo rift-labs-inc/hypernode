@@ -7,13 +7,8 @@ use bitcoin::{hashes::Hash, hex::DisplayHex, opcodes::all::OP_RETURN, script::Bu
 use log::{debug, info};
 
 use crate::{
-    btc_rpc::BitcoinRpcClient,
-    constants::CONFIRMATION_HEIGHT_DELTA,
-    core::ThreadSafeStore,
-    hyper_err,
-    Result,
-    error::HypernodeError,
-    proof_builder,
+    btc_rpc::BitcoinRpcClient, constants::CONFIRMATION_HEIGHT_DELTA, core::ThreadSafeStore,
+    error::HypernodeError, hyper_err, proof_builder, Result,
 };
 
 fn build_rift_inscription(order_nonce: [u8; 32]) -> Vec<u8> {
@@ -331,31 +326,33 @@ pub async fn block_listener(
             );
 
             // Download blocks concurrently
-            let blocks_with_heights: Result<Vec<(u64, Block)>> = futures::stream::iter(heights_to_download)
-                .map(|height| {
-                    let rpc = rpc.clone();
-                    async move {
-                        let block_hash = rpc.get_block_hash(height).await.map_err(|e| {
-                            hyper_err!(
-                                RpcError,
-                                "Failed to get block hash for height {}: {}",
-                                height,
-                                e
-                            )
-                        })?;
-                        let block = rpc.get_block(&block_hash).await.map_err(|e| {
-                            hyper_err!(
-                                RpcError,
-                                "Failed to get block for hash {}: {}",
-                                block_hash.to_hex_string(bitcoin::hex::Case::Lower),
-                                e
-                            )
-                        })?;
-                        Ok((height, block))
-                    }
-                })
-                .buffer_unordered(max_concurrent_requests)
-                .try_collect().await;
+            let blocks_with_heights: Result<Vec<(u64, Block)>> =
+                futures::stream::iter(heights_to_download)
+                    .map(|height| {
+                        let rpc = rpc.clone();
+                        async move {
+                            let block_hash = rpc.get_block_hash(height).await.map_err(|e| {
+                                hyper_err!(
+                                    RpcError,
+                                    "Failed to get block hash for height {}: {}",
+                                    height,
+                                    e
+                                )
+                            })?;
+                            let block = rpc.get_block(&block_hash).await.map_err(|e| {
+                                hyper_err!(
+                                    RpcError,
+                                    "Failed to get block for hash {}: {}",
+                                    block_hash.to_hex_string(bitcoin::hex::Case::Lower),
+                                    e
+                                )
+                            })?;
+                            Ok((height, block))
+                        }
+                    })
+                    .buffer_unordered(max_concurrent_requests)
+                    .try_collect()
+                    .await;
 
             let blocks_with_heights = blocks_with_heights?;
 

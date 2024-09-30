@@ -1,11 +1,11 @@
+use crate::error::HypernodeError;
+use crate::{hyper_err, Result};
 use bitcoin::consensus::deserialize;
 use bitcoin::Block;
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use reqwest::Client;
 use serde_json::Value;
-use crate::{hyper_err, Result};
-use crate::error::HypernodeError;
 
 pub struct BitcoinRpcClient {
     client: Client,
@@ -112,8 +112,8 @@ impl BitcoinRpcClient {
         let block_hexstr = result
             .as_str()
             .ok_or_else(|| hyper_err!(BitcoinRpc, "Block doesn't exist"))?;
-        let block_bytes = hex::decode(block_hexstr)
-            .map_err(|_| hyper_err!(BitcoinRpc, "Invalid block data"))?;
+        let block_bytes =
+            hex::decode(block_hexstr).map_err(|_| hyper_err!(BitcoinRpc, "Invalid block data"))?;
         deserialize::<Block>(&block_bytes)
             .map_err(|_| hyper_err!(BitcoinRpc, "Failed to deserialize block"))
     }

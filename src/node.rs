@@ -1,30 +1,37 @@
+use crate::constants::RESERVATION_DURATION_HOURS;
+use crate::core::{
+    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeWebsocket, ThreadSafeStore,
+};
+use crate::error::HypernodeError;
+use crate::HypernodeArgs;
+use crate::{btc_indexer, evm_indexer, proof_broadcast, proof_builder};
+use crate::{hyper_err, Result};
 use alloy::{
     network::EthereumWallet,
     providers::{ProviderBuilder, WsConnect},
     signers::local::PrivateKeySigner,
 };
 use std::{str::FromStr, sync::Arc};
-use crate::constants::RESERVATION_DURATION_HOURS;
-use crate::HypernodeArgs;
-use crate::core::{
-    EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeWebsocket,
-    ThreadSafeStore,
-};
-use crate::{evm_indexer, btc_indexer, proof_broadcast, proof_builder};
-use crate::{hyper_err, Result};
-use crate::error::HypernodeError;
 
 pub async fn run(args: HypernodeArgs) -> Result<()> {
-    let rift_exchange_address = alloy::primitives::Address::from_str(&args.rift_exchange_address)
-        .map_err(|e| hyper_err!(Parse, "Failed to parse Rift exchange address: {}", e))?;
+    let rift_exchange_address =
+        alloy::primitives::Address::from_str(&args.rift_exchange_address)
+            .map_err(|e| hyper_err!(Parse, "Failed to parse Rift exchange address: {}", e))?;
 
     let safe_store = Arc::new(ThreadSafeStore::new());
 
     let flashbots_url = if args.flashbots {
-        Some(args.flashbots_relay_rpc
-            .as_ref()
-            .ok_or_else(|| hyper_err!(Config, "Flashbots relay URL is required when flashbots is enabled"))?
-            .clone())
+        Some(
+            args.flashbots_relay_rpc
+                .as_ref()
+                .ok_or_else(|| {
+                    hyper_err!(
+                        Config,
+                        "Flashbots relay URL is required when flashbots is enabled"
+                    )
+                })?
+                .clone(),
+        )
     } else {
         None
     };
@@ -43,7 +50,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
             ))
             .on_ws(WsConnect::new(&args.evm_ws_rpc))
             .await
-            .map_err(|e| hyper_err!(Connection, "Failed to connect to WebSocket: {}", e))?
+            .map_err(|e| hyper_err!(Connection, "Failed to connect to WebSocket: {}", e))?,
     );
 
     let contract: Arc<RiftExchangeWebsocket> =
@@ -57,7 +64,10 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
                 .wallet(EthereumWallet::from(
                     PrivateKeySigner::from_bytes(&private_key.into()).unwrap(),
                 ))
-                .on_http(url.parse().map_err(|e| hyper_err!(Parse, "Failed to parse Flashbots URL: {}", e))?)
+                .on_http(
+                    url.parse()
+                        .map_err(|e| hyper_err!(Parse, "Failed to parse Flashbots URL: {}", e))?,
+                ),
         ),
     });
 
@@ -71,13 +81,22 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         Arc::clone(&safe_store),
         Arc::clone(&proof_broadcast_queue),
         args.mock_proof,
-        args.proof_gen_concurrency
+        args.proof_gen_concurrency,
     ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
-        evm_indexer::find_block_height_from_time(&contract, RESERVATION_DURATION_HOURS, args.evm_block_time),
-        btc_indexer::find_block_height_from_time(&args.btc_rpc, RESERVATION_DURATION_HOURS, args.btc_block_time)
-    ).map_err(|e| hyper_err!(Indexer, "Failed to find starting block heights: {}", e))?;
+        evm_indexer::find_block_height_from_time(
+            &contract,
+            RESERVATION_DURATION_HOURS,
+            args.evm_block_time
+        ),
+        btc_indexer::find_block_height_from_time(
+            &args.btc_rpc,
+            RESERVATION_DURATION_HOURS,
+            args.btc_block_time
+        )
+    )
+    .map_err(|e| hyper_err!(Indexer, "Failed to find starting block heights: {}", e))?;
 
     let synced_reservation_evm_height = evm_indexer::sync_reservations(
         Arc::clone(&contract),

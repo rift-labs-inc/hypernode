@@ -1,5 +1,5 @@
-use dotenv::dotenv;
 use clap::Parser;
+use dotenv::dotenv;
 use hypernode::HypernodeArgs;
 use hypernode::Result;
 

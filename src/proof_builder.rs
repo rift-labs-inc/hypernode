@@ -8,9 +8,9 @@ use tokio::sync::{mpsc, Semaphore};
 
 use crate::constants::MAIN_ELF;
 use crate::core::ThreadSafeStore;
+use crate::error::HypernodeError;
 use crate::proof_broadcast::{self, ProofBroadcastQueue};
 use crate::{hyper_err, Result};
-use crate::error::HypernodeError;
 use crypto_bigint::U256 as SP1OptimizedU256;
 
 pub fn buffer_to_18_decimals(amount: U256, token_decimals: u8) -> U256 {
@@ -149,9 +149,11 @@ impl ProofGenerationQueue {
             })
             .collect::<Vec<_>>();
 
-        let btc_final = reservation_metadata.btc_final
+        let btc_final = reservation_metadata
+            .btc_final
             .ok_or_else(|| hyper_err!(ProofGeneration, "BTC final data not found"))?;
-        let btc_initial = reservation_metadata.btc_initial
+        let btc_initial = reservation_metadata
+            .btc_initial
             .ok_or_else(|| hyper_err!(ProofGeneration, "BTC initial data not found"))?;
         let blocks = btc_final.blocks;
 
@@ -183,7 +185,8 @@ impl ProofGenerationQueue {
             if mock_proof_gen {
                 (Vec::new(), public_values_string)
             } else {
-                let proof = rift_lib::proof::generate_plonk_proof(circuit_input, MAIN_ELF, Some(true));
+                let proof =
+                    rift_lib::proof::generate_plonk_proof(circuit_input, MAIN_ELF, Some(true));
                 let solidity_proof_bytes = proof.bytes();
                 (solidity_proof_bytes, public_values_string)
             }
@@ -203,9 +206,14 @@ impl ProofGenerationQueue {
             .with_lock(|store| store.update_proof(item.reservation_id, solidity_proof_bytes))
             .await;
 
-        proof_broadcast_queue.add(proof_broadcast::ProofBroadcastInput::new(item.reservation_id))?;
+        proof_broadcast_queue.add(proof_broadcast::ProofBroadcastInput::new(
+            item.reservation_id,
+        ))?;
 
-        info!("Finished processing reservation_id: {:?}", item.reservation_id);
+        info!(
+            "Finished processing reservation_id: {:?}",
+            item.reservation_id
+        );
         Ok(())
     }
 }

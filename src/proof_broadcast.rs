@@ -1,7 +1,7 @@
 use crate::core::ThreadSafeStore;
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
-use crate::{hyper_err, Result};
 use crate::error::HypernodeError;
+use crate::{hyper_err, Result};
 use alloy::network::eip2718::Encodable2718;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{FixedBytes, Uint, U256};
@@ -87,10 +87,28 @@ impl ProofBroadcastQueue {
             .await
             .ok_or_else(|| hyper_err!(Store, "Reservation not found: {}", item.reservation_id))?;
 
-        let solidity_proof = reservation_metadata.proof.ok_or_else(|| hyper_err!(ProofBroadcast, "Proof not found for reservation: {}", item.reservation_id))?;
-        let btc_initial = reservation_metadata.btc_initial.ok_or_else(|| hyper_err!(ProofBroadcast, "BTC initial not found for reservation: {}", item.reservation_id))?;
-        let btc_final = reservation_metadata.btc_final.ok_or_else(|| hyper_err!(ProofBroadcast, "BTC final not found for reservation: {}", item.reservation_id))?;
-        
+        let solidity_proof = reservation_metadata.proof.ok_or_else(|| {
+            hyper_err!(
+                ProofBroadcast,
+                "Proof not found for reservation: {}",
+                item.reservation_id
+            )
+        })?;
+        let btc_initial = reservation_metadata.btc_initial.ok_or_else(|| {
+            hyper_err!(
+                ProofBroadcast,
+                "BTC initial not found for reservation: {}",
+                item.reservation_id
+            )
+        })?;
+        let btc_final = reservation_metadata.btc_final.ok_or_else(|| {
+            hyper_err!(
+                ProofBroadcast,
+                "BTC final not found for reservation: {}",
+                item.reservation_id
+            )
+        })?;
+
         let mut bitcoin_tx_id = btc_initial.txid;
         bitcoin_tx_id.reverse();
 
@@ -129,8 +147,7 @@ impl ProofBroadcastQueue {
                     btc_final
                         .blocks
                         .index(
-                            ((proposed_block_height as u64) - (safe_block_height as u64))
-                                as usize,
+                            ((proposed_block_height as u64) - (safe_block_height as u64)) as usize,
                         )
                         .header
                         .merkle_root
@@ -172,10 +189,12 @@ impl ProofBroadcastQueue {
         let tx = TransactionRequest::default()
             .to(*contract.address())
             .input(TransactionInput::new(txn_calldata.to_vec().into()));
-        
-        let tx = provider.fill(tx).await
+
+        let tx = provider
+            .fill(tx)
+            .await
             .map_err(|e| hyper_err!(Evm, "Failed to fill transaction: {}", e))?;
-        
+
         let tx_envelope = tx
             .as_builder()
             .unwrap()
@@ -183,7 +202,7 @@ impl ProofBroadcastQueue {
             .build(&provider.wallet())
             .await
             .map_err(|e| hyper_err!(Evm, "Failed to build transaction envelope: {}", e))?;
-        
+
         let tx_encoded = tx_envelope.encoded_2718();
         let pending = provider
             .send_raw_transaction(&tx_encoded)
@@ -192,7 +211,7 @@ impl ProofBroadcastQueue {
             .register()
             .await
             .map_err(|e| hyper_err!(Evm, "Failed to register transaction: {}", e))?;
-        
+
         Ok(pending.tx_hash().to_string())
     }
 
