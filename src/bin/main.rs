@@ -1,8 +1,7 @@
 use dotenv::dotenv;
 use clap::Parser;
-use eyre::Result;
 use hypernode::HypernodeArgs;
-
+use hypernode::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
