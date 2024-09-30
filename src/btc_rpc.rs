@@ -1,10 +1,11 @@
 use bitcoin::consensus::deserialize;
 use bitcoin::Block;
-use eyre::{eyre, Result, WrapErr};
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use reqwest::Client;
 use serde_json::Value;
+use crate::{hyper_err, Result};
+use crate::error::HypernodeError;
 
 pub struct BitcoinRpcClient {
     client: Client,
@@ -33,27 +34,30 @@ impl BitcoinRpcClient {
             }))
             .send()
             .await
-            .wrap_err("Failed to send request")?;
+            .map_err(|e| hyper_err!(BitcoinRpc, "Failed to send request: {}", e))?;
 
         let status = response.status();
         let text = response
             .text()
             .await
-            .wrap_err("Failed to get response body")?;
+            .map_err(|e| hyper_err!(BitcoinRpc, "Failed to get response body: {}", e))?;
 
-        let json: Value = serde_json::from_str(&text).wrap_err_with(|| {
-            eyre!(
-                "Failed to parse JSON. Method: {}, Params: {:?}, Status: {}, Body: {}",
+        let json: Value = serde_json::from_str(&text).map_err(|e| {
+            hyper_err!(
+                BitcoinRpc,
+                "Failed to parse JSON. Method: {}, Params: {:?}, Status: {}, Body: {}, Error: {}",
                 method,
                 params,
                 status,
-                text
+                text,
+                e
             )
         })?;
 
         if let Some(error) = json.get("error") {
             if !error.is_null() {
-                return Err(eyre!(
+                return Err(hyper_err!(
+                    BitcoinRpc,
                     "RPC error. Method: {}, Params: {:?}, Status: {}, Body: {}",
                     method,
                     params,
@@ -64,7 +68,8 @@ impl BitcoinRpcClient {
         }
 
         json.get("result").cloned().ok_or_else(|| {
-            eyre!(
+            hyper_err!(
+                BitcoinRpc,
                 "No 'result' in response. Method: {}, Params: {:?}, Status: {}, Body: {}",
                 method,
                 params,
@@ -73,13 +78,14 @@ impl BitcoinRpcClient {
             )
         })
     }
+
     pub async fn get_block_count(&self) -> Result<u64> {
         let result = self
             .send_request("getblockcount", Value::Array(vec![]))
             .await?;
         result
             .as_u64()
-            .ok_or_else(|| eyre::eyre!("Invalid block count"))
+            .ok_or_else(|| hyper_err!(BitcoinRpc, "Invalid block count"))
     }
 
     pub async fn get_block_hash(&self, block_height: u64) -> Result<[u8; 32]> {
@@ -88,10 +94,11 @@ impl BitcoinRpcClient {
             .await?;
         let block_hexstr = result
             .as_str()
-            .ok_or_else(|| eyre::eyre!("Block hash doesn't exist"))?;
-        let block_hash: [u8; 32] = hex::decode(block_hexstr)?
+            .ok_or_else(|| hyper_err!(BitcoinRpc, "Block hash doesn't exist"))?;
+        let block_hash: [u8; 32] = hex::decode(block_hexstr)
+            .map_err(|_| hyper_err!(BitcoinRpc, "Invalid block hash"))?
             .try_into()
-            .map_err(|_| eyre::eyre!("Invalid block hash"))?;
+            .map_err(|_| hyper_err!(BitcoinRpc, "Invalid block hash"))?;
         Ok(block_hash)
     }
 
@@ -104,9 +111,11 @@ impl BitcoinRpcClient {
             .await?;
         let block_hexstr = result
             .as_str()
-            .ok_or_else(|| eyre::eyre!("Block doesn't exist"))?;
-        let block_bytes = hex::decode(block_hexstr)?;
-        deserialize::<Block>(&block_bytes).map_err(|_| eyre::eyre!("Failed to deserialize block"))
+            .ok_or_else(|| hyper_err!(BitcoinRpc, "Block doesn't exist"))?;
+        let block_bytes = hex::decode(block_hexstr)
+            .map_err(|_| hyper_err!(BitcoinRpc, "Invalid block data"))?;
+        deserialize::<Block>(&block_bytes)
+            .map_err(|_| hyper_err!(BitcoinRpc, "Failed to deserialize block"))
     }
 
     pub async fn get_chainwork(&self, block_hash: &[u8; 32]) -> Result<[u8; 32]> {
@@ -119,11 +128,14 @@ impl BitcoinRpcClient {
         let chainwork_hexstr = result
             .get("chainwork")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre::eyre!("Chainwork doesn't exist"))?;
-        let chainwork: [u8; 32] = hex::decode(chainwork_hexstr)?.as_slice().try_into()?;
+            .ok_or_else(|| hyper_err!(BitcoinRpc, "Chainwork doesn't exist"))?;
+        let chainwork: [u8; 32] = hex::decode(chainwork_hexstr)
+            .map_err(|_| hyper_err!(BitcoinRpc, "Invalid chainwork data"))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| hyper_err!(BitcoinRpc, "Invalid chainwork data"))?;
         Ok(chainwork)
     }
-    
 }
 
 #[cfg(test)]

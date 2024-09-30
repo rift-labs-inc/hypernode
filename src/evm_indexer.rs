@@ -1,25 +1,25 @@
 use alloy::network::eip2718::Encodable2718;
+use alloy::primitives::TxHash;
 use alloy::providers::WalletProvider;
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
     network::TransactionBuilder,
-    primitives::{ Bytes, U256},
+    primitives::{Bytes, U256},
     providers::Provider,
     rpc::types::{BlockTransactionsKind, Filter, TransactionInput, TransactionRequest},
     sol_types::{SolEvent, SolValue},
 };
-use eyre::{Result, WrapErr};
 use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
-use log::info;
-use core::time;
-use std::error::Error;
+use log::{info, error};
 use std::time::{Instant, UNIX_EPOCH};
-use std::{collections::HashSet, sync::Arc, collections::HashMap};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tokio::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
+use crate::{hyper_err, Result};
+use crate::error::HypernodeError;
 use crate::{
     constants::HEADER_LOOKBACK_LIMIT,
     core::{
@@ -37,81 +37,85 @@ pub fn release_after_challenge_period(
     flashbots_provider: Arc<Option<EvmHttpProvider>>,
 ) {
     tokio::spawn(async move {
-        let buffer_seconds = 30 as u64; // buffer to ensure the ethereum block timestamp is
-                                        // past the unlock timestamp
+        let buffer_seconds = 30;
         let release_liquidity_timestamp = liquidity_unlocked_timestamp + buffer_seconds;
-        let current_timestamp = UNIX_EPOCH.elapsed().unwrap().as_secs() as u64;
-        let sleep_duration = if current_timestamp > release_liquidity_timestamp {
-            0
-        } else {
-            release_liquidity_timestamp - current_timestamp
-        };
+        let current_timestamp = UNIX_EPOCH.elapsed().unwrap().as_secs();
+        let sleep_duration = release_liquidity_timestamp.saturating_sub(current_timestamp);
 
         info!(
-            "Releasing liquidity for reservation index: {} after challenge period, waiting for {:#?}",
+            "Releasing liquidity for reservation index: {} after challenge period, waiting for {:?}",
             swap_reservation_index,
-            time::Duration::from_secs(sleep_duration.into())
+            Duration::from_secs(sleep_duration)
         );
-        // get current utc timestamp
-        sleep(Duration::from_secs(sleep_duration.into())).await;
-        let txn_calldata = contract
-            .releaseLiquidity(swap_reservation_index)
-            .calldata()
-            .to_owned();
-        let tx_hash = match flashbots_provider.as_ref() {
-            Some(flashbots_provider) => {
-                info!("Releasing liquidity using Flashbots");
-                let tx = TransactionRequest::default()
-                    .to(*contract.address())
-                    .input(TransactionInput::new(txn_calldata));
-                let tx = contract.provider().fill(tx).await.unwrap();
-                let tx_envelope = tx
-                    .as_builder()
-                    .unwrap()
-                    .clone()
-                    .build(&contract.provider().wallet())
-                    .await
-                    .unwrap();
-                let tx_encoded = tx_envelope.encoded_2718();
-                let pending = flashbots_provider
-                    .send_raw_transaction(&tx_encoded)
-                    .await
-                    .unwrap()
-                    .register()
-                    .await
-                    .unwrap();
-                pending.tx_hash().clone()
-            }
-            None => {
-                let tx = TransactionRequest::default()
-                    .to(*contract.address())
-                    .input(TransactionInput::new(txn_calldata));
-                contract
-                    .provider()
-                    .send_transaction(tx)
-                    .await
-                    .unwrap()
-                    .tx_hash()
-                    .clone()
-            }
+        sleep(Duration::from_secs(sleep_duration)).await;
+
+        let txn_calldata = contract.releaseLiquidity(swap_reservation_index).calldata().to_owned();
+        let tx = TransactionRequest::default()
+            .to(*contract.address())
+            .input(TransactionInput::new(txn_calldata));
+
+        let result = if let Some(flashbots_provider) = flashbots_provider.as_ref() {
+            info!("Releasing liquidity using Flashbots");
+            release_via_flashbots(contract.clone(), flashbots_provider, tx).await
+        } else {
+            release_standard(contract.clone(), tx).await
         };
-        info!("Liquidity released with evm tx hash: {}", tx_hash);
+
+        match result {
+            Ok(tx_hash) => info!("Liquidity released with evm tx hash: {}", tx_hash),
+            Err(e) => error!("Failed to release liquidity: {}", e),
+        }
     });
 }
 
+async fn release_via_flashbots(
+    contract: Arc<RiftExchangeWebsocket>,
+    flashbots_provider: &EvmHttpProvider,
+    tx: TransactionRequest,
+) -> Result<TxHash> {
+    let filled_tx = contract.provider().fill(tx).await
+        .map_err(|e| hyper_err!(Evm, "Failed to fill transaction: {}", e))?;
+
+    let tx_envelope = filled_tx.as_builder().unwrap().clone().build(&contract.provider().wallet()).await
+        .map_err(|e| hyper_err!(Evm, "Failed to build transaction: {}", e))?;
+
+    let tx_encoded = tx_envelope.encoded_2718();
+    let pending = flashbots_provider.send_raw_transaction(&tx_encoded).await
+        .map_err(|e| hyper_err!(Evm, "Failed to send raw transaction: {}", e))?;
+
+    let registered = pending.register().await
+        .map_err(|e| hyper_err!(Evm, "Failed to register transaction: {}", e))?;
+
+    Ok(registered.tx_hash().clone())
+}
+
+async fn release_standard(
+    contract: Arc<RiftExchangeWebsocket>,
+    tx: TransactionRequest,
+) -> Result<TxHash> {
+    let pending = contract.provider().send_transaction(tx).await
+        .map_err(|e| hyper_err!(Evm, "Failed to send transaction: {}", e))?;
+
+    Ok(pending.tx_hash().clone())
+}
+
 pub async fn fetch_token_decimals(exchange: &RiftExchangeWebsocket) -> Result<u8> {
-    Ok(exchange.TOKEN_DECIMALS().call().await?._0)
+    exchange
+        .TOKEN_DECIMALS()
+        .call()
+        .await
+        .map(|v| v._0)
+        .map_err(|e| hyper_err!(Evm, "Failed to fetch token decimals: {}", e))
 }
 
 fn decode_vaults(encoded_vaults: Vec<u8>) -> Result<Vec<RiftExchange::DepositVault>> {
     let encoded_vaults = Vec::<Bytes>::abi_decode(&encoded_vaults, false)
-        .map_err(|_| eyre::eyre!("Failed to decode vault byte array"))?;
+        .map_err(|_| hyper_err!(Decode, "Failed to decode vault byte array"))?;
     encoded_vaults
         .into_iter()
         .map(|bytes| {
-            let vault = RiftExchange::DepositVault::abi_decode(&bytes.to_vec(), false)
-                .map_err(|e| eyre::eyre!("Failed to decode deposit vault: {}", e))?;
-            Ok(vault)
+            RiftExchange::DepositVault::abi_decode(&bytes.to_vec(), false)
+                .map_err(|e| hyper_err!(Decode, "Failed to decode deposit vault: {}", e))
         })
         .collect()
 }
@@ -127,14 +131,15 @@ pub async fn download_vaults(
         *contract.address(),
     )
     .call()
-    .await?;
+    .await
+    .map_err(|e| hyper_err!(Evm, "Failed to call DepositVaultAggregator: {}", e))?;
 
-    let vaults = decode_vaults(encoded_vaults.to_vec()).wrap_err("Failed to decode vaults")?;
-    Ok(vaults)
+    decode_vaults(encoded_vaults.to_vec())
 }
 
 fn decode_block_hashes(encoded_blocks: Vec<u8>) -> Result<Vec<[u8; 32]>> {
-    <Vec<Bytes>>::abi_decode(&encoded_blocks, false)?
+    <Vec<Bytes>>::abi_decode(&encoded_blocks, false)
+        .map_err(|e| hyper_err!(Decode, "Failed to decode block hashes: {}", e))?
         .into_iter()
         .map(|bytes| {
             let mut hash = [0u8; 32];
@@ -152,7 +157,10 @@ pub async fn download_safe_bitcoin_headers(
     lookback_count: Option<usize>,
 ) -> Result<u64> {
     let provider = contract.provider();
-    let current_evm_tip = provider.get_block_number().await?;
+    let current_evm_tip = provider
+        .get_block_number()
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to get block number: {}", e))?;
 
     let stored_tip = match end_block_height {
         Some(height) => height,
@@ -160,10 +168,12 @@ pub async fn download_safe_bitcoin_headers(
             contract
                 .currentHeight()
                 .call()
-                .await?
+                .await
+                .map_err(|e| hyper_err!(Evm, "Failed to get current height: {}", e))?
                 ._0
                 .to_be_bytes::<32>()[32 - 8..]
-                .try_into()?,
+                .try_into()
+                .map_err(|_| hyper_err!(Conversion, "Failed to convert current height to u64"))?,
         ),
     };
 
@@ -173,16 +183,15 @@ pub async fn download_safe_bitcoin_headers(
         .map(|i| U256::from(stored_tip).saturating_sub(U256::from(i)))
         .collect::<Vec<_>>();
 
-    // all the equivalent heights will be grouped, no need to sort
     heights.dedup();
 
     let encoded_blocks =
         BlockHeaderAggregator::deploy_builder(provider, heights.clone(), *contract.address())
             .call()
-            .await?;
+            .await
+            .map_err(|e| hyper_err!(Evm, "Failed to call BlockHeaderAggregator: {}", e))?;
 
-    let block_hashes =
-        decode_block_hashes(encoded_blocks.to_vec()).wrap_err("Failed to decode block hashes")?;
+    let block_hashes = decode_block_hashes(encoded_blocks.to_vec())?;
 
     store
         .with_lock(|store_guard| {
@@ -208,17 +217,19 @@ pub async fn download_reservation(
     reservation_id: U256,
     contract: Arc<RiftExchangeWebsocket>,
 ) -> Result<(U256, ReservationMetadata)> {
-    let reservation = match contract.getReservation(reservation_id).call().await {
-        Ok(res) => res._0,
-        Err(e) => {
-            return Err(eyre::eyre!(
+    let reservation = contract
+        .getReservation(reservation_id)
+        .call()
+        .await
+        .map_err(|e| {
+            hyper_err!(
+                Evm,
                 "Failed to get reservation with ID {:?}: {}",
                 reservation_id,
                 e
             )
-            .into());
-        }
-    };
+        })?
+        ._0;
 
     let vault_indexes: Vec<u32> = reservation
         .vaultIndexes
@@ -226,13 +237,11 @@ pub async fn download_reservation(
         .map(|index| u32::from_be_bytes(index.to_be_bytes::<32>()[32 - 4..].try_into().unwrap()))
         .collect();
 
-    match download_vaults(contract, vault_indexes).await {
-        Ok(vaults) => Ok((
-            reservation_id,
-            ReservationMetadata::new(reservation, vaults),
-        )),
-        Err(e) => Err(e.into()),
-    }
+    let vaults = download_vaults(contract, vault_indexes).await?;
+    Ok((
+        reservation_id,
+        ReservationMetadata::new(reservation, vaults),
+    ))
 }
 
 pub async fn find_block_height_from_time(
@@ -245,12 +254,12 @@ pub async fn find_block_height_from_time(
     let provider = rift_exchange.provider();
     let current_block = provider
         .get_block(BlockId::latest(), BlockTransactionsKind::Hashes)
-        .await?
-        .unwrap();
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to get latest block: {}", e))?
+        .ok_or_else(|| hyper_err!(Evm, "Latest block not found"))?;
     let current_timestamp = &current_block.header.timestamp;
     let target_timestamp = current_timestamp.saturating_sub(hours * 3600);
 
-    // Estimate blocks per hour (assuming ~12 second block time)
     let blocks_per_hour = 3600 / average_time_between_evm_blocks;
     let estimated_blocks_ago = hours * blocks_per_hour;
 
@@ -266,8 +275,9 @@ pub async fn find_block_height_from_time(
                 BlockId::Number(BlockNumberOrTag::Number(check_block)),
                 BlockTransactionsKind::Hashes,
             )
-            .await?
-            .unwrap();
+            .await
+            .map_err(|e| hyper_err!(Evm, "Failed to get block {}: {}", check_block, e))?
+            .ok_or_else(|| hyper_err!(Evm, "Block {} not found", check_block))?;
         let block_timestamp = block_info.header.timestamp;
 
         if block_timestamp <= target_timestamp || check_block == 0 {
@@ -280,7 +290,6 @@ pub async fn find_block_height_from_time(
             return Ok(check_block.into());
         }
 
-        // If we haven't gone back far enough, jump back by another hour's worth of blocks
         check_block = check_block.saturating_sub(blocks_per_hour);
     }
 }
@@ -296,36 +305,52 @@ pub async fn sync_reservations(
     let time = Instant::now();
     info!("Syncing reservations from block {}", start_block);
     let provider = contract.provider();
-    let latest_block: u64 = provider.get_block_number().await?;
-    // Create a filter to get logs from the last 8 hours for the specified contract
+    let latest_block: u64 = provider
+        .get_block_number()
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to get latest block number: {}", e))?;
     let log_filter = Filter::new()
         .address(*contract.address())
         .from_block(start_block)
         .to_block(latest_block);
 
-    let logs = provider.get_logs(&log_filter).await?;
+    let logs = provider
+        .get_logs(&log_filter)
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to get logs: {}", e))?;
 
-    // Process logs to determine active reservation IDs
     let mut active_reservations_set: HashSet<U256> = HashSet::new();
     let mut reservations_in_challenge: HashSet<U256> = HashSet::new();
 
     for log in logs {
         match log.topic0() {
             Some(&RiftExchange::LiquidityReserved::SIGNATURE_HASH) => {
-                let reservation_event: RiftExchange::LiquidityReserved =
-                    log.log_decode()?.inner.data;
+                let reservation_event: RiftExchange::LiquidityReserved = log
+                    .log_decode()
+                    .map_err(|e| {
+                        hyper_err!(Decode, "Failed to decode LiquidityReserved event: {}", e)
+                    })?
+                    .inner
+                    .data;
                 active_reservations_set.insert(reservation_event.swapReservationIndex);
             }
             Some(&RiftExchange::ProofSubmitted::SIGNATURE_HASH) => {
-                let proof_proposed_event: RiftExchange::ProofSubmitted =
-                    log.log_decode()?.inner.data;
-                // TODO: This is not mainnet safe, we need to validate that a proposed proof is not
-                // malicious / part of an orphan chain, instead of just removing the reservation
+                let proof_proposed_event: RiftExchange::ProofSubmitted = log
+                    .log_decode()
+                    .map_err(|e| {
+                        hyper_err!(Decode, "Failed to decode ProofSubmitted event: {}", e)
+                    })?
+                    .inner
+                    .data;
                 active_reservations_set.remove(&proof_proposed_event.swapReservationIndex);
                 reservations_in_challenge.insert(proof_proposed_event.swapReservationIndex);
             }
             Some(&RiftExchange::SwapComplete::SIGNATURE_HASH) => {
-                let swap_complete_event: RiftExchange::SwapComplete = log.log_decode()?.inner.data;
+                let swap_complete_event: RiftExchange::SwapComplete = log
+                    .log_decode()
+                    .map_err(|e| hyper_err!(Decode, "Failed to decode SwapComplete event: {}", e))?
+                    .inner
+                    .data;
                 active_reservations_set.remove(&swap_complete_event.swapReservationIndex);
                 reservations_in_challenge.remove(&swap_complete_event.swapReservationIndex);
             }
@@ -333,13 +358,12 @@ pub async fn sync_reservations(
         }
     }
 
-    // combine the active reservations and reservations in challenge into one set
+
     let reservations_to_download: HashSet<U256> = active_reservations_set
         .union(&reservations_in_challenge)
         .cloned()
         .collect();
 
-    // these are fully active reservations that are not in the challenge period
     let active_reservations_ids: Vec<U256> = active_reservations_set.into_iter().collect();
 
     let reservations_to_download: Vec<U256> = reservations_to_download.into_iter().collect();
@@ -361,7 +385,7 @@ pub async fn sync_reservations(
             .buffer_unordered(rpc_concurrency)
             .try_collect()
             .await
-            .map_err(|e: eyre::Report| e)?;
+            .map_err(|e| hyper_err!(Evm, "Failed to download reservations: {}", e))?;
 
     let reservations = downloaded_reservations
         .clone()
@@ -380,7 +404,7 @@ pub async fn sync_reservations(
             Ok(())
         })
         .await
-        .map_err(|e: Box<dyn Error>| eyre::eyre!("Failed to update reservations: {}", e))?;
+        .map_err(|e: HypernodeError| hyper_err!(Store, "Failed to update reservations: {}", e))?;
 
     info!(
         "Synced {} reservations in {:?}",
@@ -413,7 +437,11 @@ pub async fn exchange_event_listener(
     info!(
         "Rift deployed at: {} on chain ID: {}",
         contract.address(),
-        &contract.provider().get_chain_id().await?
+        &contract
+            .provider()
+            .get_chain_id()
+            .await
+            .map_err(|e| hyper_err!(Evm, "Failed to get chain ID: {}", e))?
     );
 
     // Create filters for each event.
@@ -421,23 +449,27 @@ pub async fn exchange_event_listener(
         .SwapComplete_filter()
         .from_block(start_index_block_height)
         .watch()
-        .await?;
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to create SwapComplete filter: {}", e))?;
     let liquidity_reserved_filter = contract
         .LiquidityReserved_filter()
         .from_block(start_index_block_height)
         .watch()
-        .await?;
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to create LiquidityReserved filter: {}", e))?;
     let proof_proposed_filter = contract
         .ProofSubmitted_filter()
         .from_block(start_index_block_height)
         .watch()
-        .await?;
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to create ProofSubmitted filter: {}", e))?;
 
     let blocks_added_filter = contract
         .BlocksAdded_filter()
         .from_block(start_block_header_height)
         .watch()
-        .await?;
+        .await
+        .map_err(|e| hyper_err!(Evm, "Failed to create BlocksAdded filter: {}", e))?;
 
     // Convert the filters into streams.
     let mut swap_complete_stream = swap_complete_filter.into_stream();
@@ -453,7 +485,7 @@ pub async fn exchange_event_listener(
         let flashbots_provider = Arc::clone(&flashbots_provider);
         tokio::select! {
             Some(log) = swap_complete_stream.next() => {
-                let log_data = log.clone()?;
+                let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone SwapComplete log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
 
                 let mut processed_logs_guard = processed_logs.lock().await;
@@ -470,7 +502,7 @@ pub async fn exchange_event_listener(
             }
 
             Some(log) = liquidity_reserved_stream.next() => {
-                let log_data = log.clone()?;
+                let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone LiquidityReserved log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
 
                 let mut processed_logs_guard = processed_logs.lock().await;
@@ -482,13 +514,13 @@ pub async fn exchange_event_listener(
                     let swap_reservation_index = log_data.0.swapReservationIndex;
                     let reservation = download_reservation(swap_reservation_index, Arc::clone(&contract)).await?;
                     active_reservations.with_lock(|reservations_guard| {
-                        reservations_guard.insert(swap_reservation_index, reservation.1);
+                        reservations_guard.insert(swap_reservation_index, reservation.1.clone());
                     }).await;
                 }
             }
 
             Some(log) = proof_proposed_stream.next() => {
-                let log_data = log.clone()?;
+                let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone ProofSubmitted log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
 
                 let mut processed_logs_guard = processed_logs.lock().await;
@@ -513,7 +545,7 @@ pub async fn exchange_event_listener(
             }
 
             Some(log) = blocks_added_stream.next() => {
-                let log_data = log.clone()?;
+                let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone BlocksAdded log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
 
                 let mut processed_logs_guard = processed_logs.lock().await;
