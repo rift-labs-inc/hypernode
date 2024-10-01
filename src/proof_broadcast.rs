@@ -7,8 +7,9 @@ use alloy::network::TransactionBuilder;
 use alloy::primitives::{FixedBytes, Uint, U256};
 use alloy::providers::{Provider, WalletProvider};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
-use alloy::sol_types::{sol_data::*, SolType, SolValue};
+use alloy::sol_types::SolValue;
 use rift_core::btc_light_client::AsLittleEndianBytes;
+use std::fmt::Debug;
 use std::ops::Index;
 
 use bitcoin::hashes::Hash;
@@ -40,6 +41,7 @@ impl ProofBroadcastQueue {
         store: Arc<ThreadSafeStore>,
         flashbots_provider: Arc<Option<EvmHttpProvider>>,
         contract: Arc<RiftExchangeWebsocket>,
+        debug_url: String,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let queue = ProofBroadcastQueue { sender };
@@ -48,6 +50,7 @@ impl ProofBroadcastQueue {
             store,
             flashbots_provider,
             contract,
+            debug_url,
         ));
         queue
     }
@@ -63,6 +66,7 @@ impl ProofBroadcastQueue {
         store: Arc<ThreadSafeStore>,
         flashbots_provider: Arc<Option<EvmHttpProvider>>,
         contract: Arc<RiftExchangeWebsocket>,
+        debug_url: String,
     ) {
         let provider = contract.provider();
 
@@ -72,7 +76,9 @@ impl ProofBroadcastQueue {
         );
 
         while let Some(item) = receiver.recv().await {
-            if let Err(e) = Self::process_item(item, &store, &flashbots_provider, &contract).await {
+            if let Err(e) =
+                Self::process_item(item, &store, &flashbots_provider, &contract, &debug_url).await
+            {
                 error!("Failed to process proof broadcast item: {}", e);
             }
         }
@@ -83,7 +89,9 @@ impl ProofBroadcastQueue {
         store: &Arc<ThreadSafeStore>,
         flashbots_provider: &Arc<Option<EvmHttpProvider>>,
         contract: &Arc<RiftExchangeWebsocket>,
+        debug_url: &str,
     ) -> Result<()> {
+        info!("Processing proof broadcast item: {}", item.reservation_id);
         let reservation_metadata = store
             .with_lock(|store| store.get(item.reservation_id).cloned())
             .await
@@ -205,10 +213,13 @@ impl ProofBroadcastQueue {
         let tx_hash = if flashbots_provider.is_some() {
             Self::propose_via_flashbots(contract, &txn_calldata).await?
         } else {
-            Self::propose_standard(contract, &txn_calldata).await?
+            Self::propose_standard(contract, &txn_calldata, debug_url).await?
         };
 
-        info!("Proof broadcasted with evm tx hash: {}", tx_hash.to_string());
+        info!(
+            "Proof broadcasted with evm tx hash: {}",
+            tx_hash.to_string()
+        );
         Ok(())
     }
 
@@ -320,6 +331,7 @@ impl ProofBroadcastQueue {
     async fn propose_standard(
         contract: &Arc<RiftExchangeWebsocket>,
         txn_calldata: &[u8],
+        debug_url: &str,
     ) -> Result<FixedBytes<32>> {
         let provider = contract.provider();
         let tx = TransactionRequest::default()
@@ -337,10 +349,11 @@ impl ProofBroadcastQueue {
                 let data = txn_calldata.as_hex();
                 let to = contract.address().to_string();
                 info!(
-                    "cast call {} --data {} --trace --block {} --rpc-url <RPC_URL>",
+                    "To debug failed proof broadcast run: cast call {} --data {} --trace --block {} --rpc-url {}",
                     to,
                     data,
-                    block_height
+                    block_height,
+                    debug_url
                 );
                 Err(hyper_err!(Evm, "Failed to broadcast proof: {}", e))
             }

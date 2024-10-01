@@ -200,14 +200,19 @@ impl ProofGenerationQueue {
             item.reservation_id,
             proof_gen_timer.elapsed()
         );
+
         info!("Public Inputs Encoded: {:?}", public_values_string);
+
+        let public_inputs = hex::decode(public_values_string.clone().trim_start_matches("0x")).map_err(|e| {
+            hyper_err!(ProofGeneration, "Failed to decode public inputs: {}", e)
+        })?;
 
         store
             .with_lock(|store| {
                 store.update_proof_data(
                     item.reservation_id,
                     solidity_proof_bytes,
-                    hex::decode(public_values_string).unwrap(),
+                    public_inputs,
                 )
             })
             .await;

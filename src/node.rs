@@ -75,6 +75,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         Arc::clone(&safe_store),
         Arc::clone(&flashbots_provider),
         Arc::clone(&contract),
+        args.evm_ws_rpc
     ));
 
     let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(
