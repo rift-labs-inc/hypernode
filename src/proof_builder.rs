@@ -203,7 +203,13 @@ impl ProofGenerationQueue {
         info!("Public Inputs Encoded: {:?}", public_values_string);
 
         store
-            .with_lock(|store| store.update_proof(item.reservation_id, solidity_proof_bytes))
+            .with_lock(|store| {
+                store.update_proof_data(
+                    item.reservation_id,
+                    solidity_proof_bytes,
+                    hex::decode(public_values_string).unwrap(),
+                )
+            })
             .await;
 
         proof_broadcast_queue.add(proof_broadcast::ProofBroadcastInput::new(

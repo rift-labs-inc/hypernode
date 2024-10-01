@@ -1,5 +1,5 @@
-use crate::core::ThreadSafeStore;
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
+use crate::core::{RiftExchange, ThreadSafeStore};
 use crate::error::HypernodeError;
 use crate::{hyper_err, Result};
 use alloy::network::eip2718::Encodable2718;
@@ -7,12 +7,14 @@ use alloy::network::TransactionBuilder;
 use alloy::primitives::{FixedBytes, Uint, U256};
 use alloy::providers::{Provider, WalletProvider};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
+use alloy::sol_types::{sol_data::*, SolType, SolValue};
 use rift_core::btc_light_client::AsLittleEndianBytes;
 use std::ops::Index;
 
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use crypto_bigint::{Encoding, U256 as SP1OptimizedU256};
+use json_patch::diff;
 use log::{debug, error, info};
 use rift_lib::{self, AsRiftOptimizedBlock};
 use std::sync::Arc;
@@ -115,6 +117,14 @@ impl ProofBroadcastQueue {
         let proposed_block_height = btc_initial.proposed_block_height;
         let safe_block_height = btc_final.safe_block_height;
         let confirmation_block_height = btc_final.confirmation_height;
+        let public_inputs_encoded = reservation_metadata.public_inputs.ok_or_else(|| {
+            hyper_err!(
+                ProofBroadcast,
+                "Public inputs not found for reservation: {}",
+                item.reservation_id
+            )
+        })?;
+
         let block_hashes = btc_final
             .blocks
             .iter()
@@ -138,6 +148,28 @@ impl ProofBroadcastQueue {
         .iter()
         .map(|chainwork| Uint::<256, 4>::from_be_bytes(chainwork.to_be_bytes()))
         .collect::<Vec<_>>();
+
+        Self::validate_public_inputs(
+            item.reservation_id,
+            bitcoin_tx_id.into(),
+            FixedBytes(
+                btc_final
+                    .blocks
+                    .index(((proposed_block_height as u64) - (safe_block_height as u64)) as usize)
+                    .header
+                    .merkle_root
+                    .to_byte_array()
+                    .to_little_endian(),
+            ),
+            safe_block_height as u32,
+            proposed_block_height,
+            confirmation_block_height,
+            &block_hashes,
+            &chainworks,
+            Arc::clone(contract),
+            &public_inputs_encoded,
+        )
+        .await?;
 
         let txn_calldata = contract
             .submitSwapProof(
@@ -165,7 +197,7 @@ impl ProofBroadcastQueue {
             .to_owned();
 
         debug!(
-            "proposeTransactionProof calldata for reservation {} : {}",
+            "submitSwapProof calldata for reservation {} : {}",
             item.reservation_id,
             txn_calldata.as_hex()
         );
@@ -176,14 +208,84 @@ impl ProofBroadcastQueue {
             Self::propose_standard(contract, &txn_calldata).await?
         };
 
-        info!("Proof broadcasted with evm tx hash: {}", tx_hash);
+        info!("Proof broadcasted with evm tx hash: {}", tx_hash.to_string());
+        Ok(())
+    }
+
+    // validate that circuit generated public inputs match what the contract will generate
+    async fn validate_public_inputs(
+        swap_reservation_index: Uint<256, 4>,
+        bitcoin_tx_id: FixedBytes<32>,
+        merkle_root: FixedBytes<32>,
+        safe_block_height: u32,
+        proposed_block_height: u64,
+        confirmation_block_height: u64,
+        block_hashes: &[FixedBytes<32>],
+        block_chainworks: &[Uint<256, 4>],
+        contract: Arc<RiftExchangeWebsocket>,
+        circuit_generated_public_inputs_encoded: &[u8],
+    ) -> Result<()> {
+        // call the buildPublicInputs function in the contract
+        let contract_generated_public_inputs_decoded = contract
+            .buildPublicInputs(
+                swap_reservation_index,
+                bitcoin_tx_id,
+                merkle_root,
+                safe_block_height,
+                proposed_block_height,
+                confirmation_block_height,
+                block_hashes.to_vec(),
+                block_chainworks.to_vec(),
+            )
+            .call()
+            .await
+            .map_err(|e| hyper_err!(Evm, "Failed to call buildPublicInputs: {}", e))?;
+
+        let contract_generated_public_inputs_encoded =
+            <RiftExchange::ProofPublicInputs as SolValue>::abi_encode(
+                &contract_generated_public_inputs_decoded._0,
+            );
+
+        let circuit_generated_public_inputs_decoded =
+            <RiftExchange::ProofPublicInputs as SolValue>::abi_decode(
+                circuit_generated_public_inputs_encoded,
+                false,
+            )
+            .map_err(|e| {
+                hyper_err!(
+                    ProofBroadcast,
+                    "Failed to decode circuit generated public inputs: {}",
+                    e
+                )
+            })?;
+
+        if contract_generated_public_inputs_encoded != circuit_generated_public_inputs_encoded {
+            info!(
+                "Circuit public inputs encoded: {:?}",
+                contract_generated_public_inputs_encoded
+            );
+            info!(
+                "Contract public inputs encoded: {:?}",
+                circuit_generated_public_inputs_encoded
+            );
+            let contract_json =
+                serde_json::to_value(contract_generated_public_inputs_decoded).unwrap();
+            let circuit_json =
+                serde_json::to_value(circuit_generated_public_inputs_decoded).unwrap();
+            let patch = diff(&circuit_json, &contract_json);
+            return Err(hyper_err!(
+                ProofBroadcast,
+                "Public inputs generated by the contract do not match the expected public inputs. Diff: {}", patch
+            ));
+        }
+
         Ok(())
     }
 
     async fn propose_via_flashbots(
         contract: &Arc<RiftExchangeWebsocket>,
         txn_calldata: &[u8],
-    ) -> Result<String> {
+    ) -> Result<FixedBytes<32>> {
         info!("Proposing proof using Flashbots");
         let provider = contract.provider();
         let tx = TransactionRequest::default()
@@ -212,24 +314,34 @@ impl ProofBroadcastQueue {
             .await
             .map_err(|e| hyper_err!(Evm, "Failed to register transaction: {}", e))?;
 
-        Ok(pending.tx_hash().to_string())
+        Ok(*pending.tx_hash())
     }
 
     async fn propose_standard(
         contract: &Arc<RiftExchangeWebsocket>,
         txn_calldata: &[u8],
-    ) -> Result<String> {
+    ) -> Result<FixedBytes<32>> {
         let provider = contract.provider();
         let tx = TransactionRequest::default()
             .to(*contract.address())
             .input(TransactionInput::new(txn_calldata.to_vec().into()));
 
         match provider.send_transaction(tx.clone()).await {
-            Ok(tx) => Ok(tx.tx_hash().to_string()),
+            Ok(tx) => Ok(*tx.tx_hash()),
             Err(e) => {
+                let block_height = provider
+                    .get_block_number()
+                    .await
+                    .map_err(|e| hyper_err!(Evm, "Failed to get block number: {}", e))?;
+
                 let data = txn_calldata.as_hex();
                 let to = contract.address().to_string();
-                info!("cast call {} --data {} --trace", to, data);
+                info!(
+                    "cast call {} --data {} --trace --block {} --rpc-url <RPC_URL>",
+                    to,
+                    data,
+                    block_height
+                );
                 Err(hyper_err!(Evm, "Failed to broadcast proof: {}", e))
             }
         }

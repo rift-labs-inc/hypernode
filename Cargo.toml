@@ -28,3 +28,4 @@ crypto-bigint = { git = "https://github.com/sp1-patches/RustCrypto-bigint", bran
 chrono = "0.4.38"
 serde = "1.0.210"
 thiserror = "1.0.64"
+json-patch = "2.0.0"

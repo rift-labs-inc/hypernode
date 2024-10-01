@@ -126,6 +126,7 @@ pub struct ReservationMetadata {
     pub btc_initial: Option<BitcoinReservationInProgress>,
     pub btc_final: Option<BitcoinReservationFinalized>,
     pub proof: Option<Vec<u8>>,
+    pub public_inputs: Option<Vec<u8>>,
 }
 
 impl ReservationMetadata {
@@ -139,6 +140,7 @@ impl ReservationMetadata {
             btc_initial: None,
             btc_final: None,
             proof: None,
+            public_inputs: None,
         }
     }
 }
@@ -174,8 +176,9 @@ impl Store {
         }
     }
 
-    pub fn update_proof(&mut self, id: U256, proof: Vec<u8>) {
+    pub fn update_proof_data(&mut self, id: U256, proof: Vec<u8>, public_inputs: Vec<u8>) {
         let metadata = self.reservations.get_mut(&id).unwrap();
+        metadata.public_inputs = Some(public_inputs);
         metadata.proof = Some(proof);
     }
 
