@@ -71,7 +71,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         ),
     });
 
-    let proof_broadcast_queue = Arc::new(proof_broadcast::ProofBroadcastQueue::new(
+    let proof_broadcast_queue = Arc::new(proof_broadcast::SwapProofBroadcastQueue::new(
         Arc::clone(&safe_store),
         Arc::clone(&flashbots_provider),
         Arc::clone(&contract),
@@ -145,4 +145,3 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
 
     Ok(())
 }
-

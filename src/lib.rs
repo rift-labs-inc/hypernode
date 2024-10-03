@@ -70,4 +70,3 @@ pub struct HypernodeArgs {
     #[arg(short, long, env)]
     pub flashbots_relay_rpc: Option<String>,
 }
-

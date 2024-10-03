@@ -17,8 +17,11 @@ use std::time::Instant;
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tokio::sync::Mutex;
 
+use crate::btc_rpc::BitcoinRpcClient;
+use crate::core::RiftExchange::SwapReservation;
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
 use crate::error::HypernodeError;
+use crate::proof_builder::ProofGenerationQueue;
 use crate::releaser::{self, ReleaserQueue};
 use crate::{
     constants::HEADER_LOOKBACK_LIMIT,
@@ -30,6 +33,65 @@ use crate::{
 };
 use crate::{hyper_err, Result};
 
+pub async fn validate_transaction_proofs(
+    reservations: HashMap<U256, ReservationMetadata>, // assumes these are only reservations that are actively in a challenge period
+    proof_generation_queue: Arc<ProofGenerationQueue>,
+    btc_rpc: Arc<BitcoinRpcClient>,
+    store: Arc<ThreadSafeStore>,
+) -> Result<bool> {
+    // go through and download  hashes from btc rpc theoretically used by the reservations
+    let mut hashes = HashMap::new();
+    for reservation in reservations.values() {
+        let proposed_block_height = reservation.reservation.proposedBlockHeight;
+        if hashes.contains_key(&proposed_block_height) {
+            continue;
+        }
+        let proposed_block_height_u64 = u64::from_be_bytes(
+            proposed_block_height.to_be_bytes::<32>()[32 - 8..]
+                .try_into()
+                .unwrap(),
+        );
+        let block_hash = btc_rpc.get_block_hash(proposed_block_height_u64).await?;
+        hashes.insert(proposed_block_height, block_hash);
+    }
+
+    // now go through each reservations and check if any of the hashes are NOT set of hashes we downloaded
+    // this is the height that is the "most recent" orphaned block
+    let mut newest_orphan_height: Option<U256> = None;
+    let mut oldest_orphan_height: Option<U256> = None;
+    for reservation in reservations.values() {
+        let proposed_block_height = reservation.reservation.proposedBlockHeight;
+        let proposed_block_hash = reservation.reservation.proposedBlockHash;
+        if hashes.get(&proposed_block_height).unwrap() != proposed_block_hash {
+            if newest_orphan_height.is_none()
+                || proposed_block_height > newest_orphan_height.unwrap()
+            {
+                newest_orphan_height = Some(proposed_block_height);
+            }
+            if oldest_orphan_height.is_none()
+                || proposed_block_height < oldest_orphan_height.unwrap()
+            {
+                oldest_orphan_height = Some(proposed_block_height);
+            }
+        }
+    }
+
+    if let Some(height) = newest_orphan_height {
+        // Now find a safe block in the local store that is older than the oldest orphaned block
+        let safe_block_height = store.with_lock(|store| {
+            store
+                .safe_contract_block_hashes
+                .range(..=height)
+                .next_back()
+                .map(|(k, _)| k)
+        });
+        proof_generation_queue.add(proof_generation_queue::ProofGenerationRequestInput::new(
+            height,
+        ));
+    }
+
+    Ok(true)
+}
 pub async fn broadcast_transaction_via_flashbots(
     contract: &Arc<RiftExchangeWebsocket>,
     flashbots_provider: &EvmHttpProvider,
@@ -297,6 +359,7 @@ pub async fn sync_reservations(
     contract: Arc<RiftExchangeWebsocket>,
     safe_store: Arc<ThreadSafeStore>,
     release_queue: Arc<ReleaserQueue>,
+    proof_generation_queue: Arc<ProofGenerationQueue>,
     start_block: u64,
     rpc_concurrency: usize,
 ) -> Result<u64> {

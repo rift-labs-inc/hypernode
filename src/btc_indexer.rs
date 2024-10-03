@@ -227,7 +227,11 @@ async fn analyze_reservations_for_sufficient_confirmations(
 
         // add it the proof gen queue
         info!("Adding reservation: {} to proof generation queue", id);
-        proof_gen_queue.add(proof_builder::ProofGenerationInput::new(id.clone()))?;
+        proof_gen_queue.add(proof_builder::ProofGenerationInput::Transaction(
+            proof_builder::TransactionProofInput {
+                reservation_id: id.into(),
+            },
+        ))?;
     }
 
     Ok(())

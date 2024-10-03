@@ -1,9 +1,12 @@
 [submodule "circuits"]
 	path = circuits
 	url = https://github.com/rift-labs-inc/circuits
+	branch = main
 [submodule "contracts"]
 	path = contracts
 	url = https://github.com/rift-labs-inc/contracts
+	branch = main
 [submodule "data-aggregation-contracts"]
 	path = data-aggregation-contracts
 	url = https://github.com/rift-labs-inc/data-aggregation-contracts
+	branch = main

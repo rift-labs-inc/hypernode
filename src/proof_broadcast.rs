@@ -3,7 +3,7 @@ use crate::core::{RiftExchange, ThreadSafeStore};
 use crate::error::HypernodeError;
 use crate::evm_indexer;
 use crate::{hyper_err, Result};
-use alloy::primitives::{FixedBytes, Uint, U256};
+use alloy::primitives::{Bytes, FixedBytes, Uint, U256};
 use alloy::providers::WalletProvider;
 use alloy::sol_types::SolValue;
 use rift_core::btc_light_client::AsLittleEndianBytes;
@@ -18,16 +18,26 @@ use log::{debug, error, info};
 use rift_lib::{self, AsRiftOptimizedBlock};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-
-#[derive(Debug)]
-pub struct ProofBroadcastInput {
-    reservation_id: U256,
+#[derive(Debug, Clone)]
+pub enum ProofBroadcastInput {
+    Transaction(TransactionBroadcastInput),
+    Block(BlockBroadcastInput),
 }
 
-impl ProofBroadcastInput {
-    pub fn new(reservation_id: U256) -> Self {
-        ProofBroadcastInput { reservation_id }
-    }
+#[derive(Debug, Clone)]
+pub struct TransactionBroadcastInput {
+    pub reservation_id: U256,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockBroadcastInput {
+    pub safe_chainwork: U256,
+    pub safe_block_height: u64,
+    pub blocks: Vec<bitcoin::Block>,
+    pub retarget_block: bitcoin::Block,
+    pub retarget_block_height: u64,
+    pub solidity_proof: Vec<u8>,
+    pub public_inputs: Vec<u8>,
 }
 
 pub struct ProofBroadcastQueue {
@@ -74,16 +84,40 @@ impl ProofBroadcastQueue {
         );
 
         while let Some(item) = receiver.recv().await {
-            if let Err(e) =
-                Self::process_item(item, &store, &flashbots_provider, &contract, &debug_url).await
-            {
-                error!("Failed to process proof broadcast item: {}", e);
+            match item {
+                ProofBroadcastInput::Transaction(transaction_input) => {
+                    if let Err(e) = Self::process_transaction_item(
+                        transaction_input,
+                        &store,
+                        &flashbots_provider,
+                        &contract,
+                        &debug_url,
+                    )
+                    .await
+                    {
+                        error!("Failed to process transaction proof broadcast item: {}", e);
+                    }
+                }
+                ProofBroadcastInput::Block(block_input) => {
+                    // Process block immediately without concurrency limit
+                    if let Err(e) = Self::process_block_item(
+                        block_input,
+                        &store,
+                        &flashbots_provider,
+                        &contract,
+                        &debug_url,
+                    )
+                    .await
+                    {
+                        error!("Failed to process block proof broadcast item: {}", e);
+                    }
+                }
             }
         }
     }
 
-    async fn process_item(
-        item: ProofBroadcastInput,
+    async fn process_transaction_item(
+        item: TransactionBroadcastInput,
         store: &Arc<ThreadSafeStore>,
         flashbots_provider: &Arc<Option<EvmHttpProvider>>,
         contract: &Arc<RiftExchangeWebsocket>,
@@ -174,6 +208,7 @@ impl ProofBroadcastQueue {
             &chainworks,
             Arc::clone(contract),
             &public_inputs_encoded,
+            true,
         )
         .await?;
 
@@ -220,7 +255,93 @@ impl ProofBroadcastQueue {
         };
 
         info!(
-            "Proof broadcasted with evm tx hash: {}",
+            "Transaction Proof broadcasted with evm tx hash: {}",
+            tx_hash.to_string()
+        );
+        Ok(())
+    }
+
+    async fn process_block_item(
+        item: BlockBroadcastInput,
+        store: &Arc<ThreadSafeStore>,
+        flashbots_provider: &Arc<Option<EvmHttpProvider>>,
+        contract: &Arc<RiftExchangeWebsocket>,
+        debug_url: &str,
+    ) -> Result<()> {
+        // TODO: Implement block processing logic here
+        // This method will be called immediately when a block item is received
+        let safe_block_height = item.safe_block_height;
+        let blocks = item.blocks;
+        let retarget_block = item.retarget_block;
+        let retarget_block_height = item.retarget_block_height;
+        let confirmation_block_height = safe_block_height + blocks.len() as u64;
+        let solidity_proof = item.solidity_proof;
+        let public_inputs = item.public_inputs;
+
+        let block_hashes = blocks
+            .iter()
+            .map(|block| {
+                let mut block_hash = block.block_hash().to_raw_hash().to_byte_array();
+                block_hash.reverse();
+                FixedBytes::from_slice(&block_hash)
+            })
+            .collect::<Vec<_>>();
+
+        let chainworks = rift_lib::transaction::get_chainworks(
+            blocks
+                .iter()
+                .zip(safe_block_height..safe_block_height + block_hashes.len() as u64)
+                .map(|(block, height)| block.as_rift_optimized_block(height))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            SP1OptimizedU256::from_be_slice(&item.safe_chainwork.to_be_bytes::<32>()),
+        )
+        .iter()
+        .map(|chainwork| Uint::<256, 4>::from_be_bytes(chainwork.to_be_bytes()))
+        .collect::<Vec<_>>();
+
+        Self::validate_public_inputs(
+            Uint::from(0u8),
+            FixedBytes::<32>::ZERO,
+            FixedBytes::<32>::ZERO,
+            safe_block_height as u32,
+            retarget_block_height,
+            confirmation_block_height,
+            &block_hashes,
+            &chainworks,
+            Arc::clone(contract),
+            &public_inputs,
+            false,
+        )
+        .await?;
+
+        let txn_calldata = contract
+            .proveBlocks(
+                safe_block_height as u32,
+                retarget_block_height,
+                confirmation_block_height,
+                block_hashes,
+                chainworks,
+                solidity_proof.into(),
+            )
+            .calldata()
+            .to_owned();
+
+        debug!("proveBlocks calldata: {:?}", txn_calldata.as_hex());
+
+        let tx_hash = if let Some(flashbots_provider) = flashbots_provider.as_ref() {
+            evm_indexer::broadcast_transaction_via_flashbots(
+                contract,
+                flashbots_provider,
+                &txn_calldata,
+            )
+            .await?
+        } else {
+            evm_indexer::broadcast_transaction(contract, &txn_calldata, debug_url).await?
+        };
+
+        info!(
+            "Block Proof broadcasted with evm tx hash: {}",
             tx_hash.to_string()
         );
         Ok(())
@@ -238,6 +359,7 @@ impl ProofBroadcastQueue {
         block_chainworks: &[Uint<256, 4>],
         contract: Arc<RiftExchangeWebsocket>,
         circuit_generated_public_inputs_encoded: &[u8],
+        is_transaction_proof: bool,
     ) -> Result<()> {
         // call the buildPublicInputs function in the contract
         let contract_generated_public_inputs_decoded = contract
@@ -250,7 +372,7 @@ impl ProofBroadcastQueue {
                 confirmation_block_height,
                 block_hashes.to_vec(),
                 block_chainworks.to_vec(),
-                true,
+                is_transaction_proof,
             )
             .call()
             .await
