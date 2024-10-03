@@ -161,7 +161,7 @@ impl ProofGenerationQueue {
         let proposed_block_index = btc_initial.proposed_block_height - btc_final.safe_block_height;
         let retarget_block = btc_final.retarget_block;
 
-        let circuit_input = rift_lib::proof::build_proof_input(
+        let circuit_input = rift_lib::proof::build_transaction_proof_input(
             order_nonce,
             &liquidity_reservations,
             SP1OptimizedU256::from_be_slice(&btc_final.safe_block_chainwork),
@@ -203,17 +203,12 @@ impl ProofGenerationQueue {
 
         info!("Public Inputs Encoded: {:?}", public_values_string);
 
-        let public_inputs = hex::decode(public_values_string.clone().trim_start_matches("0x")).map_err(|e| {
-            hyper_err!(ProofGeneration, "Failed to decode public inputs: {}", e)
-        })?;
+        let public_inputs = hex::decode(public_values_string.clone().trim_start_matches("0x"))
+            .map_err(|e| hyper_err!(ProofGeneration, "Failed to decode public inputs: {}", e))?;
 
         store
             .with_lock(|store| {
-                store.update_proof_data(
-                    item.reservation_id,
-                    solidity_proof_bytes,
-                    public_inputs,
-                )
+                store.update_proof_data(item.reservation_id, solidity_proof_bytes, public_inputs)
             })
             .await;
 

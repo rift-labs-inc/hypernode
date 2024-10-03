@@ -7,6 +7,7 @@ pub mod evm_indexer;
 pub mod node;
 pub mod proof_broadcast;
 pub mod proof_builder;
+pub mod releaser;
 
 use clap::Parser;
 
@@ -69,3 +70,4 @@ pub struct HypernodeArgs {
     #[arg(short, long, env)]
     pub flashbots_relay_rpc: Option<String>,
 }
+

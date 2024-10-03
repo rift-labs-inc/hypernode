@@ -3,9 +3,9 @@ use crate::core::{
     EvmHttpProvider, EvmWebsocketProvider, RiftExchange, RiftExchangeWebsocket, ThreadSafeStore,
 };
 use crate::error::HypernodeError;
-use crate::HypernodeArgs;
 use crate::{btc_indexer, evm_indexer, proof_broadcast, proof_builder};
 use crate::{hyper_err, Result};
+use crate::{releaser, HypernodeArgs};
 use alloy::{
     network::EthereumWallet,
     providers::{ProviderBuilder, WsConnect},
@@ -75,7 +75,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         Arc::clone(&safe_store),
         Arc::clone(&flashbots_provider),
         Arc::clone(&contract),
-        args.evm_ws_rpc
+        args.evm_ws_rpc.as_ref(),
     ));
 
     let proof_gen_queue = Arc::new(proof_builder::ProofGenerationQueue::new(
@@ -83,6 +83,12 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
         Arc::clone(&proof_broadcast_queue),
         args.mock_proof,
         args.proof_gen_concurrency,
+    ));
+
+    let release_queue = Arc::new(releaser::ReleaserQueue::new(
+        Arc::clone(&flashbots_provider),
+        Arc::clone(&contract),
+        args.evm_ws_rpc.as_ref(),
     ));
 
     let (start_evm_block_height, start_btc_block_height) = tokio::try_join!(
@@ -101,8 +107,8 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
 
     let synced_reservation_evm_height = evm_indexer::sync_reservations(
         Arc::clone(&contract),
-        Arc::clone(&flashbots_provider),
         Arc::clone(&safe_store),
+        Arc::clone(&release_queue),
         start_evm_block_height,
         args.evm_rpc_concurrency,
     )
@@ -121,7 +127,7 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
     tokio::try_join!(
         evm_indexer::exchange_event_listener(
             Arc::clone(&contract),
-            Arc::clone(&flashbots_provider),
+            Arc::clone(&release_queue),
             synced_reservation_evm_height,
             synced_block_header_evm_height,
             Arc::clone(&safe_store)
@@ -139,3 +145,4 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
 
     Ok(())
 }
+

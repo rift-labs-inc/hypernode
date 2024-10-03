@@ -1,5 +1,5 @@
 use alloy::network::eip2718::Encodable2718;
-use alloy::primitives::TxHash;
+use alloy::primitives::FixedBytes;
 use alloy::providers::WalletProvider;
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
@@ -9,16 +9,17 @@ use alloy::{
     rpc::types::{BlockTransactionsKind, Filter, TransactionInput, TransactionRequest},
     sol_types::{SolEvent, SolValue},
 };
+use bitcoin::hex::DisplayHex;
 use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
-use log::{error, info};
-use std::time::{Instant, UNIX_EPOCH};
+use log::info;
+use std::time::Instant;
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
-use tokio::time::Duration;
-use tokio::{sync::Mutex, time::sleep};
+use tokio::sync::Mutex;
 
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
 use crate::error::HypernodeError;
+use crate::releaser::{self, ReleaserQueue};
 use crate::{
     constants::HEADER_LOOKBACK_LIMIT,
     core::{
@@ -29,92 +30,71 @@ use crate::{
 };
 use crate::{hyper_err, Result};
 
-// non blocking
-pub fn release_after_challenge_period(
-    swap_reservation_index: U256,
-    liquidity_unlocked_timestamp: u64,
-    contract: Arc<RiftExchangeWebsocket>,
-    flashbots_provider: Arc<Option<EvmHttpProvider>>,
-) {
-    tokio::spawn(async move {
-        let buffer_seconds = 30;
-        let release_liquidity_timestamp = liquidity_unlocked_timestamp + buffer_seconds;
-        let current_timestamp = UNIX_EPOCH.elapsed().unwrap().as_secs();
-        let sleep_duration = release_liquidity_timestamp.saturating_sub(current_timestamp);
-
-        info!(
-            "Releasing liquidity for reservation index: {} after challenge period, waiting for {:?}",
-            swap_reservation_index,
-            Duration::from_secs(sleep_duration)
-        );
-        sleep(Duration::from_secs(sleep_duration)).await;
-
-        let txn_calldata = contract
-            .releaseLiquidity(swap_reservation_index)
-            .calldata()
-            .to_owned();
-        let tx = TransactionRequest::default()
-            .to(*contract.address())
-            .input(TransactionInput::new(txn_calldata));
-
-        let result = if let Some(flashbots_provider) = flashbots_provider.as_ref() {
-            info!("Releasing liquidity using Flashbots");
-            release_via_flashbots(contract.clone(), flashbots_provider, tx).await
-        } else {
-            release_standard(contract.clone(), tx).await
-        };
-
-        match result {
-            Ok(tx_hash) => info!("Liquidity released with evm tx hash: {}", tx_hash),
-            Err(e) => error!("Failed to release liquidity: {}", e),
-        }
-    });
-}
-
-async fn release_via_flashbots(
-    contract: Arc<RiftExchangeWebsocket>,
+pub async fn broadcast_transaction_via_flashbots(
+    contract: &Arc<RiftExchangeWebsocket>,
     flashbots_provider: &EvmHttpProvider,
-    tx: TransactionRequest,
-) -> Result<TxHash> {
-    let filled_tx = contract
-        .provider()
+    txn_calldata: &[u8],
+) -> Result<FixedBytes<32>> {
+    let provider = contract.provider();
+    let tx = TransactionRequest::default()
+        .to(*contract.address())
+        .input(TransactionInput::new(txn_calldata.to_vec().into()));
+
+    let tx = provider
         .fill(tx)
         .await
         .map_err(|e| hyper_err!(Evm, "Failed to fill transaction: {}", e))?;
 
-    let tx_envelope = filled_tx
+    let tx_envelope = tx
         .as_builder()
         .unwrap()
         .clone()
-        .build(&contract.provider().wallet())
+        .build(&provider.wallet())
         .await
-        .map_err(|e| hyper_err!(Evm, "Failed to build transaction: {}", e))?;
+        .map_err(|e| hyper_err!(Evm, "Failed to build transaction envelope: {}", e))?;
 
     let tx_encoded = tx_envelope.encoded_2718();
     let pending = flashbots_provider
         .send_raw_transaction(&tx_encoded)
         .await
-        .map_err(|e| hyper_err!(Evm, "Failed to send raw transaction: {}", e))?;
-
-    let registered = pending
+        .map_err(|e| hyper_err!(Evm, "Failed to send raw transaction: {}", e))?
         .register()
         .await
         .map_err(|e| hyper_err!(Evm, "Failed to register transaction: {}", e))?;
 
-    Ok(registered.tx_hash().clone())
+    Ok(*pending.tx_hash())
 }
 
-async fn release_standard(
-    contract: Arc<RiftExchangeWebsocket>,
-    tx: TransactionRequest,
-) -> Result<TxHash> {
-    let pending = contract
-        .provider()
-        .send_transaction(tx)
-        .await
-        .map_err(|e| hyper_err!(Evm, "Failed to send transaction: {}", e))?;
+pub async fn broadcast_transaction(
+    contract: &Arc<RiftExchangeWebsocket>,
+    txn_calldata: &[u8],
+    debug_url: &str,
+) -> Result<FixedBytes<32>> {
+    let provider = contract.provider();
+    let tx = TransactionRequest::default()
+        .to(*contract.address())
+        .input(TransactionInput::new(txn_calldata.to_vec().into()));
 
-    Ok(pending.tx_hash().clone())
+    match provider.send_transaction(tx.clone()).await {
+        Ok(tx) => Ok(*tx.tx_hash()),
+        Err(e) => {
+            let block_height = provider
+                .get_block_number()
+                .await
+                .map_err(|e| hyper_err!(Evm, "Failed to get block number: {}", e))?;
+
+            let data = txn_calldata.as_hex();
+            let to = contract.address().to_string();
+            info!(
+                    "To debug failed proof broadcast run: cast call {} --data {} --trace --block {} --rpc-url {}",
+                    to,
+                    data,
+                    block_height,
+                    debug_url
+                );
+            Err(hyper_err!(Evm, "Failed to broadcast proof: {}", e))
+        }
+    }
 }
 
 pub async fn fetch_token_decimals(exchange: &RiftExchangeWebsocket) -> Result<u8> {
@@ -315,8 +295,8 @@ pub async fn find_block_height_from_time(
 // Goes through the last RESERVATION_DURATION_HOURS worth of ethereum blocks and collects all reservations
 pub async fn sync_reservations(
     contract: Arc<RiftExchangeWebsocket>,
-    flashbots_provider: Arc<Option<EvmHttpProvider>>,
     safe_store: Arc<ThreadSafeStore>,
+    release_queue: Arc<ReleaserQueue>,
     start_block: u64,
     rpc_concurrency: usize,
 ) -> Result<u64> {
@@ -429,24 +409,25 @@ pub async fn sync_reservations(
         time.elapsed()
     );
 
-    // Now spawn a task to call releaseLiquidity on all reservations in a challenge period after
-    // their challenge period ends
-    downloaded_reservations
-        .into_iter()
+    for (reservation_id, metadata) in downloaded_reservations
+        .iter()
         .filter(|(id, _)| reservations_in_challenge.contains(id))
-        .for_each(|(id, metadata)| {
-            let unlock_timestamp = metadata.reservation.liquidityUnlockedTimestamp;
-            let contract = Arc::clone(&contract);
-            let flashbots_provider = Arc::clone(&flashbots_provider);
-            release_after_challenge_period(id, unlock_timestamp, contract, flashbots_provider);
-        });
+    {
+        let unlock_timestamp = metadata.reservation.liquidityUnlockedTimestamp;
+        release_queue
+            .add(releaser::ReleaserRequestInput::new(
+                *reservation_id,
+                unlock_timestamp,
+            ))
+            .await?;
+    }
 
     Ok(latest_block)
 }
 
 pub async fn exchange_event_listener(
     contract: Arc<RiftExchangeWebsocket>,
-    flashbots_provider: Arc<Option<EvmHttpProvider>>,
+    release_queue: Arc<ReleaserQueue>,
     start_index_block_height: u64,
     start_block_header_height: u64,
     active_reservations: Arc<ThreadSafeStore>,
@@ -499,7 +480,6 @@ pub async fn exchange_event_listener(
 
     loop {
         let contract = Arc::clone(&contract);
-        let flashbots_provider = Arc::clone(&flashbots_provider);
         tokio::select! {
             Some(log) = swap_complete_stream.next() => {
                 let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone SwapComplete log: {}", e))?;
@@ -551,13 +531,10 @@ pub async fn exchange_event_listener(
                     active_reservations.with_lock(|reservations_guard| {
                         reservations_guard.insert(swap_reservation_index, reservation_metadata.1.clone());
                     }).await;
-
-                    release_after_challenge_period(
+                    release_queue.add(releaser::ReleaserRequestInput::new(
                         swap_reservation_index,
-                        reservation_metadata.1.reservation.liquidityUnlockedTimestamp,
-                        Arc::clone(&contract),
-                        Arc::clone(&flashbots_provider)
-                    );
+                        reservation_metadata.1.reservation.liquidityUnlockedTimestamp
+                    )).await?;
                 }
             }
 

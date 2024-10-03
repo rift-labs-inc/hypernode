@@ -1,12 +1,10 @@
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
 use crate::core::{RiftExchange, ThreadSafeStore};
 use crate::error::HypernodeError;
+use crate::evm_indexer;
 use crate::{hyper_err, Result};
-use alloy::network::eip2718::Encodable2718;
-use alloy::network::TransactionBuilder;
 use alloy::primitives::{FixedBytes, Uint, U256};
-use alloy::providers::{Provider, WalletProvider};
-use alloy::rpc::types::{TransactionInput, TransactionRequest};
+use alloy::providers::WalletProvider;
 use alloy::sol_types::SolValue;
 use rift_core::btc_light_client::AsLittleEndianBytes;
 use std::fmt::Debug;
@@ -41,7 +39,7 @@ impl ProofBroadcastQueue {
         store: Arc<ThreadSafeStore>,
         flashbots_provider: Arc<Option<EvmHttpProvider>>,
         contract: Arc<RiftExchangeWebsocket>,
-        debug_url: String,
+        debug_url: &str,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let queue = ProofBroadcastQueue { sender };
@@ -50,7 +48,7 @@ impl ProofBroadcastQueue {
             store,
             flashbots_provider,
             contract,
-            debug_url,
+            debug_url.to_string(),
         ));
         queue
     }
@@ -210,10 +208,15 @@ impl ProofBroadcastQueue {
             txn_calldata.as_hex()
         );
 
-        let tx_hash = if flashbots_provider.is_some() {
-            Self::propose_via_flashbots(contract, &txn_calldata).await?
+        let tx_hash = if let Some(flashbots_provider) = flashbots_provider.as_ref() {
+            evm_indexer::broadcast_transaction_via_flashbots(
+                contract,
+                flashbots_provider,
+                &txn_calldata,
+            )
+            .await?
         } else {
-            Self::propose_standard(contract, &txn_calldata, debug_url).await?
+            evm_indexer::broadcast_transaction(contract, &txn_calldata, debug_url).await?
         };
 
         info!(
@@ -247,6 +250,7 @@ impl ProofBroadcastQueue {
                 confirmation_block_height,
                 block_hashes.to_vec(),
                 block_chainworks.to_vec(),
+                true,
             )
             .call()
             .await
@@ -291,72 +295,5 @@ impl ProofBroadcastQueue {
         }
 
         Ok(())
-    }
-
-    async fn propose_via_flashbots(
-        contract: &Arc<RiftExchangeWebsocket>,
-        txn_calldata: &[u8],
-    ) -> Result<FixedBytes<32>> {
-        info!("Proposing proof using Flashbots");
-        let provider = contract.provider();
-        let tx = TransactionRequest::default()
-            .to(*contract.address())
-            .input(TransactionInput::new(txn_calldata.to_vec().into()));
-
-        let tx = provider
-            .fill(tx)
-            .await
-            .map_err(|e| hyper_err!(Evm, "Failed to fill transaction: {}", e))?;
-
-        let tx_envelope = tx
-            .as_builder()
-            .unwrap()
-            .clone()
-            .build(&provider.wallet())
-            .await
-            .map_err(|e| hyper_err!(Evm, "Failed to build transaction envelope: {}", e))?;
-
-        let tx_encoded = tx_envelope.encoded_2718();
-        let pending = provider
-            .send_raw_transaction(&tx_encoded)
-            .await
-            .map_err(|e| hyper_err!(Evm, "Failed to send raw transaction: {}", e))?
-            .register()
-            .await
-            .map_err(|e| hyper_err!(Evm, "Failed to register transaction: {}", e))?;
-
-        Ok(*pending.tx_hash())
-    }
-
-    async fn propose_standard(
-        contract: &Arc<RiftExchangeWebsocket>,
-        txn_calldata: &[u8],
-        debug_url: &str,
-    ) -> Result<FixedBytes<32>> {
-        let provider = contract.provider();
-        let tx = TransactionRequest::default()
-            .to(*contract.address())
-            .input(TransactionInput::new(txn_calldata.to_vec().into()));
-
-        match provider.send_transaction(tx.clone()).await {
-            Ok(tx) => Ok(*tx.tx_hash()),
-            Err(e) => {
-                let block_height = provider
-                    .get_block_number()
-                    .await
-                    .map_err(|e| hyper_err!(Evm, "Failed to get block number: {}", e))?;
-
-                let data = txn_calldata.as_hex();
-                let to = contract.address().to_string();
-                info!(
-                    "To debug failed proof broadcast run: cast call {} --data {} --trace --block {} --rpc-url {}",
-                    to,
-                    data,
-                    block_height,
-                    debug_url
-                );
-                Err(hyper_err!(Evm, "Failed to broadcast proof: {}", e))
-            }
-        }
     }
 }
