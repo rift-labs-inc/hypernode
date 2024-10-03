@@ -53,7 +53,21 @@ impl ReleaserQueue {
 
     pub async fn add(&self, req: ReleaserRequestInput) -> Result<()> {
         let mut release_queue_handle = self.release_queue.lock().await;
-        release_queue_handle.push(req);
+        if !release_queue_handle
+            .iter()
+            .any(|r| r.reservation_id == req.reservation_id)
+        {
+            info!(
+                "Added new release request for reservation ID: {}",
+                &req.reservation_id
+            );
+            release_queue_handle.push(req);
+        } else {
+            info!(
+                "Release request for reservation ID: {} already exists in the queue",
+                req.reservation_id
+            );
+        }
         Ok(())
     }
 
@@ -98,15 +112,51 @@ impl ReleaserQueue {
     }
 
     async fn process_queue(&self, block: Block<Transaction>) -> Result<()> {
-        // Implement the logic to process the queue based on the new block
-        // This might involve checking if any reservations are now unlockable
-        // and calling releaseLiquidity for those that are
-        for releaser_request in self.release_queue.lock().await.iter() {
-            if block.header.timestamp > releaser_request.unlock_timestamp {
-                self.release_liquidity(releaser_request.reservation_id)
-                    .await?;
+        let current_timestamp = block.header.timestamp;
+        let mut queue = self.release_queue.lock().await;
+
+        // Separate ready and not ready items
+        let (ready, not_ready): (Vec<_>, Vec<_>) = queue
+            .drain(..)
+            .partition(|req| current_timestamp > req.unlock_timestamp);
+
+        // Process all ready items concurrently
+        let release_futures = ready.into_iter().map(|req| {
+            let reservation_id = req.reservation_id;
+            async move {
+                match self.release_liquidity(reservation_id).await {
+                    Ok(_) => {
+                        info!(
+                            "Successfully released liquidity for reservation ID: {}",
+                            reservation_id
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to release liquidity for reservation ID: {}, Error: {:?}",
+                            reservation_id,
+                            e
+                        );
+                        Err(e)
+                    }
+                }
+            }
+        });
+
+        // Wait for all release operations to complete
+        let results: Vec<Result<()>> = futures::future::join_all(release_futures).await;
+
+        // Log any errors that occurred during processing
+        for result in results {
+            if let Err(e) = result {
+                log::error!("Error during batch processing: {:?}", e);
             }
         }
+
+        // Update the queue with remaining items
+        *queue = not_ready;
+
         Ok(())
     }
 }
