@@ -48,14 +48,6 @@ sol!(
     #[allow(missing_docs)]
     #[sol(rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    WETH,
-    "artifacts/WETH.json"
-);
-
-sol!(
-    #[allow(missing_docs)]
-    #[sol(rpc)]
-    #[derive(serde::Serialize, serde::Deserialize)]
     IERC20,
     "artifacts/IERC20.json"
 );
