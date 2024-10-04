@@ -100,7 +100,7 @@ pub async fn broadcast_transaction(
 
 pub async fn fetch_token_decimals(exchange: &RiftExchangeWebsocket) -> Result<u8> {
     exchange
-        .TOKEN_DECIMALS()
+        .tokenDecimals()
         .call()
         .await
         .map(|v| v._0)
