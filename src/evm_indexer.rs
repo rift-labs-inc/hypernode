@@ -12,10 +12,11 @@ use alloy::{
 use bitcoin::hex::DisplayHex;
 use futures::stream::{self, TryStreamExt};
 use futures_util::StreamExt;
-use log::info;
 use std::time::Instant;
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
+use log::{info, error};
 
 use crate::core::{EvmHttpProvider, RiftExchangeWebsocket};
 use crate::error::HypernodeError;
@@ -428,10 +429,43 @@ pub async fn sync_reservations(
 pub async fn exchange_event_listener(
     contract: Arc<RiftExchangeWebsocket>,
     release_queue: Arc<ReleaserQueue>,
+    mut start_index_block_height: u64,
+    mut start_block_header_height: u64,
+    active_reservations: Arc<ThreadSafeStore>,
+) -> Result<()> {
+    const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+    loop {
+        let result = try_exchange_event_listener(
+            Arc::clone(&contract),
+            Arc::clone(&release_queue),
+            start_index_block_height,
+            start_block_header_height,
+            Arc::clone(&active_reservations),
+        ).await;
+
+        match result {
+            Ok((new_index_height, new_header_height)) => {
+                // Update the start heights for the next iteration
+                start_index_block_height = new_index_height;
+                start_block_header_height = new_header_height;
+                info!("Event listener completed successfully. Restarting from block heights: index={}, header={}", start_index_block_height, start_block_header_height);
+            }
+            Err(e) => {
+                error!("Error in event listener: {}. Retrying in {:?}...", e, RETRY_DELAY);
+                sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+async fn try_exchange_event_listener(
+    contract: Arc<RiftExchangeWebsocket>,
+    release_queue: Arc<ReleaserQueue>,
     start_index_block_height: u64,
     start_block_header_height: u64,
     active_reservations: Arc<ThreadSafeStore>,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     info!(
         "Rift deployed at: {} on chain ID: {}",
         contract.address(),
@@ -461,7 +495,6 @@ pub async fn exchange_event_listener(
         .watch()
         .await
         .map_err(|e| hyper_err!(Evm, "Failed to create ProofSubmitted filter: {}", e))?;
-
     let blocks_added_filter = contract
         .BlocksAdded_filter()
         .from_block(start_block_header_height)
@@ -478,8 +511,10 @@ pub async fn exchange_event_listener(
     // Use a HashSet to keep track of already-processed logs
     let processed_logs = Arc::new(Mutex::new(HashSet::new()));
 
+    let mut current_index_block_height = start_index_block_height;
+    let mut current_block_header_height = start_block_header_height;
+
     loop {
-        let contract = Arc::clone(&contract);
         tokio::select! {
             Some(log) = swap_complete_stream.next() => {
                 let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone SwapComplete log: {}", e))?;
@@ -496,8 +531,8 @@ pub async fn exchange_event_listener(
                         reservations_guard.remove(swap_reservation_index);
                     }).await;
                 }
+                current_index_block_height = log_data.1.block_number.unwrap();
             }
-
             Some(log) = liquidity_reserved_stream.next() => {
                 let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone LiquidityReserved log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
@@ -514,8 +549,8 @@ pub async fn exchange_event_listener(
                         reservations_guard.insert(swap_reservation_index, reservation.1.clone());
                     }).await;
                 }
+                current_index_block_height = log_data.1.block_number.unwrap();
             }
-
             Some(log) = proof_proposed_stream.next() => {
                 let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone ProofSubmitted log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
@@ -536,8 +571,8 @@ pub async fn exchange_event_listener(
                         reservation_metadata.1.reservation.liquidityUnlockedTimestamp
                     )).await?;
                 }
+                current_index_block_height = log_data.1.block_number.unwrap();
             }
-
             Some(log) = blocks_added_stream.next() => {
                 let log_data = log.clone().map_err(|e| hyper_err!(Evm, "Failed to clone BlocksAdded log: {}", e))?;
                 let log_identifier = (log_data.1.block_number, log_data.1.transaction_index, log_data.1.log_index);
@@ -557,7 +592,12 @@ pub async fn exchange_event_listener(
                         Some(end_block_height),
                         Some(u64::from_be_bytes(blocks_added.count.to_be_bytes::<32>()[32-8..].try_into().unwrap()) as usize)).await?;
                 }
+                current_block_header_height = log_data.1.block_number.unwrap();
             }
-        };
+            else => {
+                info!("All event streams have closed. Returning current block heights.");
+                return Ok((current_index_block_height, current_block_header_height));
+            }
+        }
     }
 }
