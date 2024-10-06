@@ -7,7 +7,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Block, Transaction};
 use futures::lock::Mutex;
 use futures::StreamExt;
-use log::info;
+use log::{debug, info};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -119,6 +119,21 @@ impl ReleaserQueue {
         let (ready, not_ready): (Vec<_>, Vec<_>) = queue
             .drain(..)
             .partition(|req| current_timestamp > req.unlock_timestamp);
+
+        if !ready.is_empty() {
+            debug!("Processing queue at block timestamp: {}", current_timestamp);
+            debug!(
+                "Ready releaser items: {:?}",
+                ready.iter().map(|r| r).collect::<Vec<_>>()
+            );
+        }
+        if !not_ready.is_empty() {
+            debug!("Processing queue at block timestamp: {}", current_timestamp);
+            debug!(
+                "Not ready releaser indexes: {:?}",
+                not_ready.iter().map(|r| r).collect::<Vec<_>>()
+            );
+        }
 
         // Process all ready items concurrently
         let release_futures = ready.into_iter().map(|req| {
