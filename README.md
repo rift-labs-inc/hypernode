@@ -1,5 +1,5 @@
 # Hypernode
-*DEPRECATED, all protocol code now located [here](https://github.com/rift-labs-inc/protocol)*
+*DEPRECATED, all protocol code now located [here](https://github.com/rift-labs-inc/protocol)* <br>
 Maintains an internal state of the rift exchange contract and the bitcoin blockchain to generate proofs of payment.
 
 ## Installation
